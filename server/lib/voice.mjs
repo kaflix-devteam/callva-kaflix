@@ -110,17 +110,22 @@ export function getVoiceConfig() {
     tts: providerFromEnv('VOICE_TTS_PROVIDER', fallback),
     asr: providerFromEnv('VOICE_ASR_PROVIDER', fallback),
   }
+  const openaiModels = {
+    llm: envString('OPENAI_LLM_MODEL') || DEFAULTS.openaiLlm,
+    tts: envString('OPENAI_TTS_MODEL') || DEFAULTS.openaiTts,
+    asr: envString('OPENAI_ASR_MODEL') || DEFAULTS.openaiAsr,
+  }
   const models = {
-    llm: providers.llm === 'openai' ? envString('OPENAI_LLM_MODEL') || DEFAULTS.openaiLlm : qwenModel,
-    tts: providers.tts === 'openai' ? envString('OPENAI_TTS_MODEL') || DEFAULTS.openaiTts : null, // qwen: reported by /healthz
-    asr: providers.asr === 'openai' ? envString('OPENAI_ASR_MODEL') || DEFAULTS.openaiAsr : null,
+    llm: providers.llm === 'openai' ? openaiModels.llm : qwenModel,
+    tts: providers.tts === 'openai' ? openaiModels.tts : null, // qwen: reported by /healthz
+    asr: providers.asr === 'openai' ? openaiModels.asr : null,
   }
   const ready = {
     llm: providers.llm === 'openai' ? Boolean(openaiKey) : Boolean(llmUrl),
     tts: providers.tts === 'openai' ? Boolean(openaiKey) : Boolean(ttsUrl),
     asr: providers.asr === 'openai' ? Boolean(openaiKey) : Boolean(asrUrl),
   }
-  return { providers, models, ready, configured: ready.llm && ready.tts, llmUrl, ttsUrl, asrUrl, qwenModel, openaiKey, openaiBase }
+  return { providers, models, openaiModels, ready, configured: ready.llm && ready.tts, llmUrl, ttsUrl, asrUrl, qwenModel, openaiKey, openaiBase }
 }
 
 /* ---------- scenarios ---------- */
@@ -151,16 +156,31 @@ export function findSpeed(id) {
   return personaData.speeds.find((s) => s.id === id) ?? null
 }
 
+/** Effective TTS provider for a persona: a per-persona pin (`provider: 'qwen'|'openai'`) wins over VOICE_TTS_PROVIDER. */
+export function ttsProviderFor(persona, cfg = getVoiceConfig()) {
+  return persona?.provider === 'openai' || persona?.provider === 'qwen' ? persona.provider : cfg.providers.tts
+}
+
+/** Every TTS provider some persona may use (global default + per-persona pins) — health treats all of them as active. */
+export function activeTtsProviders(cfg = getVoiceConfig()) {
+  return [...new Set([cfg.providers.tts, ...personaData.personas.map((p) => ttsProviderFor(p, cfg))])]
+}
+
 /** Public persona list for the UI — explicit mapping so `style` / `instructions` never leak. */
 export function getVoiceOptions(cfg = getVoiceConfig()) {
-  const provider = cfg.providers.tts
   return {
     default: personaData.default,
     speeds: personaData.speeds.map(({ id, label, factor }) => ({ id, label, factor })),
-    personas: personaData.personas.map((p) => ({
-      id: p.id, name: p.name, tagline: p.tagline, sample: p.sample, gender: p.gender,
-      provider, voice: provider === 'openai' ? p.openai.voice : p.qwen.speaker,
-    })),
+    personas: personaData.personas.map((p) => {
+      const provider = ttsProviderFor(p, cfg)
+      return {
+        id: p.id, name: p.name, tagline: p.tagline, sample: p.sample, gender: p.gender,
+        provider,
+        voice: provider === 'openai' ? p.openai.voice : p.qwen.speaker,
+        // qwen TTS has no speed control, so speed is only real when the effective provider is openai
+        supportsSpeed: (typeof p.supportsSpeed === 'boolean' ? p.supportsSpeed : true) && provider === 'openai',
+      }
+    }),
   }
 }
 
@@ -181,9 +201,9 @@ export function resolveVoice(input) {
 
 const clampSpeed = (x) => Math.min(SPEED_MAX, Math.max(SPEED_MIN, Math.round(x * 100) / 100))
 
-/** Provider-specific synthesis parameters for a persona + speed. */
-export function ttsParams(persona, speed, cfg = getVoiceConfig()) {
-  if (cfg.providers.tts === 'openai') {
+/** Provider-specific synthesis parameters for a persona + speed (provider defaults to the persona's effective one). */
+export function ttsParams(persona, speed, cfg = getVoiceConfig(), provider = ttsProviderFor(persona, cfg)) {
+  if (provider === 'openai') {
     return {
       provider: 'openai',
       voice: persona.openai.voice,
@@ -527,10 +547,9 @@ async function runHealthProbe() {
   ])
   const qwen = { llm: qwenLlm, tts: qwenTts, asr: qwenAsr }
 
-  const service = (kind) => {
-    const provider = cfg.providers[kind]
+  const entryFor = (kind, provider) => {
     if (provider === 'openai') {
-      const model = cfg.models[kind]
+      const model = cfg.openaiModels[kind]
       const entry = { ok: openai.ok, provider, model, latencyMs: openai.latencyMs }
       if (!openai.ok) entry.error = openai.error
       else if (openai.models.size > 0 && !openai.models.has(model)) {
@@ -545,9 +564,14 @@ async function runHealthProbe() {
     if (q.error) entry.error = q.error
     return entry
   }
-  const llm = service('llm')
-  const tts = service('tts')
-  const asr = service('asr')
+  const llm = entryFor('llm', cfg.providers.llm)
+  const asr = entryFor('asr', cfg.providers.asr)
+  // TTS: the global provider plus every per-persona pin counts as active; ok when any of them is usable.
+  const ttsProviders = activeTtsProviders(cfg)
+  const ttsDetail = Object.fromEntries(ttsProviders.map((p) => [p, entryFor('tts', p)]))
+  const tts = { ...ttsDetail[cfg.providers.tts], ok: ttsProviders.some((p) => ttsDetail[p].ok), providers: ttsDetail }
+  if (tts.ok) delete tts.error
+  else tts.error = ttsProviders.map((p) => ttsDetail[p].error).filter(Boolean).join(' / ') || tts.error
   const { models: _models, ...openaiPublic } = openai
   return { enabled: llm.ok && tts.ok, providers: { ...cfg.providers }, llm, tts, asr, openai: openaiPublic, qwen, checkedAt }
 }
@@ -687,14 +711,33 @@ export async function llmQwen({ system, messages, timeoutMs = TIMEOUTS.chat }, c
  */
 export async function synthesize(text, { persona, speed, timeoutMs = TIMEOUTS.tts }) {
   const cfg = getVoiceConfig()
-  const params = ttsParams(persona, speed, cfg)
-  return params.provider === 'openai'
-    ? ttsOpenai(text, params, cfg, timeoutMs)
-    : ttsQwen(text, params, cfg, timeoutMs)
+  const provider = ttsProviderFor(persona, cfg)
+  if (provider === 'openai') {
+    if (!cfg.openaiKey) throw new VoiceError(502, '음성 합성 설정이 없습니다 (openai, OPENAI_API_KEY)')
+    return ttsOpenai(text, ttsParams(persona, speed, cfg, 'openai'), cfg, timeoutMs)
+  }
+  // qwen. A persona pinned to qwen may fall back to its openai voice when the GPU server does not respond
+  // (connection/timeout/5xx — never for input errors). Global VOICE_TTS_PROVIDER=qwen never falls back.
+  const canFallback = persona.provider === 'qwen' && Boolean(cfg.openaiKey) && typeof persona.openai?.voice === 'string'
+  const fallback = async (reason) => {
+    console.warn(`[voice] tts: persona "${persona.id}" pins qwen but ${reason} → falling back to openai:${persona.openai.voice}`)
+    const out = await ttsOpenai(text, ttsParams(persona, speed, cfg, 'openai'), cfg, timeoutMs)
+    return { ...out, fallbackFrom: 'qwen' }
+  }
+  if (!cfg.ttsUrl) {
+    if (!canFallback) throw new VoiceError(502, '음성 합성 서버 설정이 없습니다 (qwen, VOICE_TTS_URL)')
+    return fallback('VOICE_TTS_URL is not set')
+  }
+  try {
+    return await ttsQwen(text, ttsParams(persona, speed, cfg, 'qwen'), cfg, timeoutMs)
+  } catch (err) {
+    if (!canFallback || !(err instanceof VoiceError) || (err.status !== 502 && err.status !== 504)) throw err
+    return fallback(`the qwen server failed (${err.status} ${err.message})`)
+  }
 }
 
 export async function ttsOpenai(text, { voice, speed, instructions }, cfg = getVoiceConfig(), timeoutMs = TIMEOUTS.tts) {
-  const model = cfg.models.tts
+  const model = cfg.openaiModels.tts
   const t0 = now()
   const res = await upstreamFetch(`${cfg.openaiBase}/audio/speech`, {
     method: 'POST',

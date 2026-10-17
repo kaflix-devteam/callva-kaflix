@@ -159,7 +159,8 @@ curl -X POST 'http://localhost:3001/api/voice/asr?scenarioId=restaurant' \
 
 `shared/voicePersonas.json`에 목소리 4종(수진·미영·준호·상철)과 말 빠르기 3단계(`slow` 0.9 · `normal` 1.0 · `fast` 1.15)가 정의되어 있습니다. 프런트·서버가 같은 파일을 읽습니다.
 
-- **TTS**: `openai`면 `persona.openai.voice`·`instructions`를 쓰고 속도는 `persona.openai.speed × speeds.factor`(0.5~2.0으로 클램프). `qwen`이면 `persona.qwen.speaker`만 전달하고 속도는 무시됩니다(현재 JSON은 네 페르소나 모두 같은 `speaker`라 qwen 모드에서는 목소리가 한 가지입니다).
+- **TTS 프로바이더 결정** = `persona.provider ?? VOICE_TTS_PROVIDER`. 페르소나에 `provider`가 지정돼 있으면(예: 수진 → `qwen`/Sohee) 전역 설정보다 우선합니다. 지정 프로바이더가 `qwen`인데 GPU 서버가 응답하지 않으면(연결 실패·타임아웃·5xx) 그 페르소나의 `openai` 설정으로 폴백하고 로그에 경고를 남기며, 응답 `audio.voice.provider`에는 **실제 사용한 프로바이더**(폴백 시 `fallbackFrom: 'qwen'` 추가)가 담깁니다. 전역 `VOICE_TTS_PROVIDER=qwen`은 폴백하지 않습니다. `/personas`의 `supportsSpeed`는 실제 프로바이더가 `openai`일 때만 `true`입니다. health의 `tts`는 전역 + 페르소나 지정 프로바이더를 모두 활성으로 보고 하나라도 정상이면 `ok:true`, 상세는 `tts.providers`에 프로바이더별로 담깁니다.
+- **TTS 파라미터**: `openai`면 `persona.openai.voice`·`instructions`를 쓰고 속도는 `persona.openai.speed × speeds.factor`(0.5~2.0으로 클램프). `qwen`이면 `persona.qwen.speaker`만 전달하고 속도는 무시됩니다(현재 JSON은 네 페르소나 모두 같은 `speaker`라 qwen 쪽 목소리는 한 가지입니다).
 - **LLM**: 시스템 프롬프트에 `persona.style` 한 단락이 "말투:" 항목으로 들어가 답변 어조가 바뀝니다(규칙·길이 제한은 그대로).
 - `/personas` 응답의 `provider`·`voice`는 현재 TTS 프로바이더 기준입니다. `style`·`instructions`는 서버 안에서만 씁니다.
 

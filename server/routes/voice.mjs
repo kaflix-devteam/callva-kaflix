@@ -79,7 +79,9 @@ function decodeWavBase64(value) {
 }
 
 const present = (v) => v !== undefined && v !== null && v !== ''
-const voiceInfo = (persona, out) => ({ persona: persona.id, provider: out.provider, voice: out.voice })
+/** actual provider/voice used (a qwen-pinned persona may have fallen back to openai → `fallbackFrom`) */
+const voiceInfo = (persona, out) => ({ persona: persona.id, provider: out.provider, voice: out.voice, ...(out.fallbackFrom ? { fallbackFrom: out.fallbackFrom } : {}) })
+const ttsStage = (out) => `${stage(out.provider, out.ttsMs)}${out.fallbackFrom ? ` (fallback from ${out.fallbackFrom})` : ''}`
 
 /* ---------- always available (no model needed) ---------- */
 voiceRouter.get('/health', async (_req, res, next) => {
@@ -138,7 +140,7 @@ voiceRouter.post('/tts', jsonBody, async (req, res, next) => {
     const { persona, speed } = resolveVoice(body.voice)
 
     const out = await withSlot(() => synthesize(text, { persona, speed }))
-    stamp(res, { route: 'tts', persona: persona.id, speed: speed.id, chars: text.length, tts: stage(out.provider, out.ttsMs), audio: `${out.seconds ?? '-'}s`, total: fmtMs(since(t0)) })
+    stamp(res, { route: 'tts', persona: persona.id, speed: speed.id, chars: text.length, tts: ttsStage(out), audio: `${out.seconds ?? '-'}s`, total: fmtMs(since(t0)) })
     res.set('Content-Type', out.contentType)
     res.set('Content-Length', String(out.buffer.length))
     res.set('Cache-Control', 'no-store')
@@ -256,7 +258,7 @@ voiceRouter.post('/turn', jsonBody, async (req, res, next) => {
       route: 'turn', scenario: scenario.id, persona: persona.id, speed: speed.id, input: wav ? 'audio' : 'text',
       asr: stage(timings.providers.asr, timings.asrMs),
       llm: stage(timings.providers.llm, timings.llmMs),
-      tts: timings.ttsError ? `${timings.providers.tts} ERR` : stage(timings.providers.tts, timings.ttsMs),
+      tts: timings.ttsError ? `${timings.providers.tts} ERR` : ttsStage({ provider: timings.providers.tts, ttsMs: timings.ttsMs, fallbackFrom: result.audio?.voice?.fallbackFrom }),
       audio: result.audio ? `${result.audio.seconds ?? '-'}s` : null,
       tok: tok(usage),
       total: fmtMs(timings.totalMs),

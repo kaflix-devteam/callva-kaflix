@@ -32,6 +32,12 @@ export interface VoiceHealth {
   /** which backend serves each stage (newer servers only) */
   providers?: { asr: VoiceProvider; llm: VoiceProvider; tts: VoiceProvider }
   openai?: { ok: boolean; latencyMs?: number; error?: string }
+  /** GPU (Qwen) stack probes — present when the server also runs the Qwen backends */
+  qwen?: {
+    llm?: { ok: boolean; model?: string; latencyMs?: number; error?: string }
+    tts?: { ok: boolean; model?: string; speaker?: string; latencyMs?: number; error?: string }
+    asr?: { ok: boolean; model?: string; latencyMs?: number; error?: string }
+  }
   checkedAt: string
 }
 
@@ -51,9 +57,15 @@ export interface VoicePersona {
   tagline: string
   sample: string
   gender: string
-  /** only present when served by the API */
-  provider?: VoiceProvider
+  /** TTS backend for this persona ('qwen' = fixed GPU voice); null/absent → follows health.providers.tts */
+  provider?: VoiceProvider | null
   voice?: string
+  /** false → the voice ignores 말 빠르기 (e.g. Qwen3-TTS Sohee); absent → true */
+  supportsSpeed?: boolean
+}
+
+export function personaSupportsSpeed(persona: VoicePersona | null | undefined): boolean {
+  return persona?.supportsSpeed !== false
 }
 
 export interface VoicePersonasResponse {
@@ -255,12 +267,28 @@ export function describeVoiceUnavailable(health: VoiceHealth | null, error: unkn
 export function describeVoiceModels(health: VoiceHealth | null, persona?: VoicePersona | null): string {
   if (!health) return ''
   if (health.providers || health.llm?.provider || health.tts?.provider) {
-    const ttsVoice = health.tts?.provider === 'openai' ? persona?.voice : health.tts?.speaker
     const llm = health.llm?.model || (health.providers?.llm === 'openai' ? 'OpenAI LLM' : 'qwen3.5:4b')
-    const tts = (health.tts?.model || (health.providers?.tts === 'openai' ? 'OpenAI TTS' : 'Qwen3-TTS')) + (ttsVoice ? `(${ttsVoice})` : '')
     const asr = health.asr?.model || (health.providers?.asr === 'openai' ? 'OpenAI ASR' : 'Qwen3-ASR')
-    return [llm, tts, asr].join(' · ')
+    return [llm, describeTtsVoice(health, persona), asr].join(' · ')
   }
   const parts = [health.llm?.model || 'LLM', health.tts?.speaker ? `Qwen3-TTS (${health.tts.speaker})` : 'Qwen3-TTS', 'Qwen3-ASR']
   return parts.join(' · ')
+}
+
+/**
+ * TTS engine(voice) for the selected persona. The persona's own provider/voice wins
+ * (e.g. 수진 → "Qwen3-TTS(Sohee)" even when health.providers.tts is openai); without
+ * a persona provider it follows the server's TTS provider.
+ */
+export function describeTtsVoice(health: VoiceHealth | null, persona?: VoicePersona | null): string {
+  const provider: VoiceProvider | undefined = persona?.provider ?? health?.tts?.provider ?? health?.providers?.tts
+  if (provider === 'qwen') {
+    const speaker = persona?.voice || health?.qwen?.tts?.speaker || health?.tts?.speaker
+    return `Qwen3-TTS${speaker ? `(${speaker})` : ''}`
+  }
+  if (provider === 'openai') {
+    const model = (health?.tts?.provider === 'openai' && health.tts.model) || 'gpt-4o-mini-tts'
+    return `${model}${persona?.voice ? `(${persona.voice})` : ''}`
+  }
+  return health?.tts?.speaker ? `Qwen3-TTS (${health.tts.speaker})` : 'Qwen3-TTS'
 }

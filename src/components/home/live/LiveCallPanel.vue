@@ -18,11 +18,13 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   AlertTriangle,
+  ArrowRight,
   Bot,
   ChevronDown,
   Headphones,
   Keyboard,
   Mic,
+  Phone,
   PhoneCall,
   PhoneOff,
   PhoneOutgoing,
@@ -36,7 +38,9 @@ import type { DemoScenario } from '@/data/demoScenarios'
 import { ui } from '@/lib/ui'
 import {
   VoiceApiError,
+  describeTtsVoice,
   describeVoiceModels,
+  personaSupportsSpeed,
   fetchVoiceTts,
   postVoiceTurn,
   type VoiceHealth,
@@ -169,8 +173,17 @@ const micTitle = computed(() => (micOk.value ? '누른 채 말하기 (Space)' : 
 const selectedPersona = computed<VoicePersona | null>(
   () => props.catalog.personas.find((p) => p.id === personaId.value) ?? props.catalog.personas[0] ?? null,
 )
-const voiceSelection = computed<VoiceSelection>(() => ({ persona: selectedPersona.value?.id ?? personaId.value, speed: speedId.value }))
-const personaChip = computed(() => (selectedPersona.value ? `${selectedPersona.value.name} · ${selectedPersona.value.tagline}` : ''))
+const voiceSelection = computed<VoiceSelection>(() => ({
+  persona: selectedPersona.value?.id ?? personaId.value,
+  // a fixed-speed voice (수진 / Qwen3-TTS) always goes out as 'normal'; the UI keeps the user's pick for the others
+  speed: personaSupportsSpeed(selectedPersona.value) ? speedId.value : 'normal',
+}))
+const personaChip = computed(() => {
+  const p = selectedPersona.value
+  if (!p) return ''
+  const tts = props.health ? describeTtsVoice(props.health, p) : ''
+  return [`${p.name} · ${p.tagline}`, tts].filter(Boolean).join(' · ')
+})
 const modelInfo = computed(() => describeVoiceModels(props.health, selectedPersona.value))
 const facts = computed(() => props.voice?.facts ?? [])
 const greeting = computed(
@@ -435,7 +448,10 @@ async function previewVoice(id: string) {
   previewing.value = id
   previewLoading.value = true
   try {
-    const tts = await fetchVoiceTts(persona.sample, { voice: { persona: id, speed: speedId.value }, signal: controller.signal })
+    const tts = await fetchVoiceTts(persona.sample, {
+      voice: { persona: id, speed: personaSupportsSpeed(persona) ? speedId.value : 'normal' },
+      signal: controller.signal,
+    })
     if (token !== previewToken) return
     previewLoading.value = false
     await player?.play(tts.base64, tts.mime)
@@ -846,31 +862,17 @@ watch(phase, () => scrollLog())
       </div>
 
       <!-- Idle / start screen: voice picker + 통화 시작 -->
-      <div v-if="!inCall" class="flex flex-1 flex-col px-4 py-5 sm:px-5">
-        <div class="flex flex-col items-center text-center">
-          <span class="inline-flex h-12 w-12 items-center justify-center rounded-full bg-emerald-600 text-white shadow-lg shadow-emerald-900/20">
-            <component :is="scenario.outbound ? PhoneOutgoing : PhoneCall" class="h-5 w-5" aria-hidden="true" />
-          </span>
-          <p v-if="ended" class="mt-4 text-sm font-semibold text-stone-900">통화가 종료되었습니다</p>
-          <p class="mt-2 text-sm leading-6 text-stone-600">
-          <template v-if="ended">같은 시나리오로 다시 시작하거나 데모를 닫을 수 있습니다.</template>
-          <template v-else-if="handsFreeOn">
-            버튼을 누르면 마이크 권한을 묻고 AI 상담원이 먼저 인사합니다.<br />
-            인사가 끝나면 전화처럼 그냥 말씀하세요 — 자동으로 인식합니다.
-          </template>
-          <template v-else-if="micOk">
-            버튼을 누르면 AI 상담원이 먼저 인사합니다.<br />
-            마이크를 누른 채 말하거나, 텍스트로 대화해 보세요.
-          </template>
-          <template v-else>
-            버튼을 누르면 AI 상담원이 먼저 인사합니다.<br />
-            텍스트로 대화해 보세요.
-          </template>
-          </p>
-        </div>
+      <div v-if="!inCall" class="flex flex-1 flex-col px-4 py-4 sm:px-5">
+        <!-- compact intro so the 통화 시작 button stays above the fold -->
+        <p class="text-center text-xs leading-5 text-stone-500" data-testid="live-intro">
+          <template v-if="ended"><span class="font-semibold text-stone-900">통화가 종료되었습니다.</span> 같은 시나리오로 다시 시작하거나 데모를 닫을 수 있습니다.</template>
+          <template v-else-if="handsFreeOn">통화 시작을 누르면 마이크 권한을 묻고 AI 상담원이 먼저 인사합니다. 그다음엔 전화처럼 그냥 말씀하세요 — 자동으로 인식합니다.</template>
+          <template v-else-if="micOk">통화 시작을 누르면 AI 상담원이 먼저 인사합니다. 마이크를 누른 채 말하거나 텍스트로 대화해 보세요.</template>
+          <template v-else>통화 시작을 누르면 AI 상담원이 먼저 인사합니다. 텍스트로 대화해 보세요.</template>
+        </p>
 
         <VoicePicker
-          class="mt-5"
+          class="mt-4"
           :catalog="catalog"
           :persona="personaId"
           :speed="speedId"
@@ -882,12 +884,27 @@ watch(phase, () => scrollLog())
           @preview="previewVoice"
         />
 
-        <div class="mt-5 flex flex-wrap items-center justify-center gap-3">
-          <button type="button" :class="ui.btnPrimary" data-testid="live-start" @click="startCall">
-            <PhoneCall class="h-4 w-4" aria-hidden="true" />
-            {{ ended ? '다시 통화 시작' : '통화 시작' }}
-          </button>
-          <button v-if="ended" type="button" :class="ui.linkEmerald" @click="emit('close')">
+        <button
+          type="button"
+          class="group mt-4 flex w-full items-center gap-4 rounded-2xl bg-stone-950 px-5 py-4 text-left text-white shadow-lg shadow-stone-900/20 transition-colors hover:bg-stone-800 focus:outline-none focus:ring-2 focus:ring-stone-900 focus:ring-offset-2"
+          data-testid="live-start"
+          @click="startCall"
+        >
+          <span class="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-emerald-500 text-white" aria-hidden="true">
+            <Phone class="h-5 w-5" />
+          </span>
+          <span class="min-w-0 flex-1">
+            <span class="block text-base font-semibold">{{ ended ? '다시 통화 시작' : '통화 시작' }}</span>
+            <span class="mt-0.5 block text-xs leading-5 text-stone-300">
+              <template v-if="handsFreeOn">마이크로 말하면 AI가 음성으로 답합니다</template>
+              <template v-else-if="micOk">마이크 버튼을 누른 채 말하면 AI가 음성으로 답합니다</template>
+              <template v-else>텍스트로 대화하면 AI가 음성으로 답합니다</template>
+            </span>
+          </span>
+          <ArrowRight class="h-5 w-5 shrink-0 text-stone-400 transition-colors group-hover:text-white" aria-hidden="true" />
+        </button>
+        <div v-if="ended" class="mt-3 flex justify-center">
+          <button type="button" :class="ui.linkEmerald" @click="emit('close')">
             <X class="h-4 w-4" aria-hidden="true" />
             데모 닫기
           </button>

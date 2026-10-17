@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
-import { Bot, CheckCircle2, PhoneCall, PhoneOutgoing, Radio, RotateCcw, User, X } from 'lucide-vue-next'
+import { Bot, CheckCircle2, Info, Loader2, PhoneCall, PhoneOutgoing, Radio, RotateCcw, User, X } from 'lucide-vue-next'
 import type { DemoScenario } from '@/data/demoScenarios'
 import { demoTranscripts, type TranscriptLine } from '@/data/demoTranscripts'
 import { ui } from '@/lib/ui'
@@ -22,15 +22,22 @@ const emit = defineEmits<{ close: [] }>()
 
 const LINE_INTERVAL_MS = 900
 const HEALTH_INTERVAL_MS = 20_000
+/** The live tab waits at most this long for the first health answer before falling back to the script. */
+const HEALTH_TIMEOUT_MS = 6_000
 
 const isOpen = computed(() => props.scenario !== null)
 const transcript = computed(() => (props.scenario ? demoTranscripts[props.scenario.id] : undefined))
 const titleId = computed(() => `demo-modal-title-${props.scenario?.id ?? 'none'}`)
 
-/* ---------- mode: 시뮬레이션 | 실제 AI 통화 ---------- */
+/* ---------- mode: AI 통화 (default) | 대본 미리보기 ---------- */
 type Mode = 'sim' | 'live'
-const mode = ref<Mode>('sim')
+const mode = ref<Mode>('live')
 const dialogEl = ref<HTMLElement | null>(null)
+/** first health check of this open has answered (ok or not) */
+const healthResolved = ref(false)
+/** we moved the user to the script because the voice server was unavailable on open */
+const autoSwitched = ref(false)
+let userPickedTab = false
 
 const voiceEntry = computed<VoiceScenario | null>(() => {
   const id = props.scenario?.id
@@ -44,7 +51,18 @@ function localVoiceCatalog(): VoicePersonasResponse {
   return {
     default: voicePersonas.default,
     speeds: voicePersonas.speeds.map((s) => ({ id: s.id as VoicePersonasResponse['speeds'][number]['id'], label: s.label, factor: s.factor })),
-    personas: voicePersonas.personas.map(({ id, name, tagline, sample, gender }) => ({ id, name, tagline, sample, gender })),
+    personas: voicePersonas.personas.map((p) => {
+      const raw = p as Record<string, unknown>
+      return {
+        id: p.id,
+        name: p.name,
+        tagline: p.tagline,
+        sample: p.sample,
+        gender: p.gender,
+        provider: raw.provider === 'qwen' || raw.provider === 'openai' ? raw.provider : null,
+        supportsSpeed: raw.supportsSpeed !== false,
+      }
+    }),
   }
 }
 const voiceCatalog = ref<VoicePersonasResponse>(localVoiceCatalog())
@@ -75,25 +93,44 @@ const liveEnabled = computed(() => !healthError.value && health.value?.enabled =
 const liveActive = ref(false)
 const liveReason = computed(() => describeVoiceUnavailable(health.value, healthError.value) ?? '')
 
+function healthSignal(controller: AbortController): AbortSignal {
+  // TimeoutError (not AbortError) → mapped to "unreachable" by the client, so a hung proxy still resolves the UI.
+  if (typeof AbortSignal.any === 'function' && typeof AbortSignal.timeout === 'function') {
+    return AbortSignal.any([controller.signal, AbortSignal.timeout(HEALTH_TIMEOUT_MS)])
+  }
+  return controller.signal
+}
+
 async function checkHealth() {
   healthAbort?.abort()
   const controller = new AbortController()
   healthAbort = controller
   healthChecking.value = true
+  let settled = false
   try {
-    const result = await fetchVoiceHealth(controller.signal)
+    const result = await fetchVoiceHealth(healthSignal(controller))
     if (healthAbort !== controller) return
     health.value = result
     healthError.value = null
+    settled = true
   } catch (err) {
     if (healthAbort !== controller) return
     if (err instanceof DOMException && err.name === 'AbortError') return
     health.value = null
     healthError.value = err
+    settled = true
   } finally {
     if (healthAbort === controller) {
       healthChecking.value = false
       healthAbort = null
+    }
+  }
+  if (settled && !healthResolved.value) {
+    healthResolved.value = true
+    // First answer of this open: fall back to the script only if the user has not picked a tab yet.
+    if (!liveEnabled.value && mode.value === 'live' && !userPickedTab && !liveActive.value) {
+      mode.value = 'sim'
+      autoSwitched.value = true
     }
   }
 }
@@ -113,6 +150,7 @@ function stopHealthPolling() {
 }
 
 function setMode(next: Mode) {
+  userPickedTab = true
   if (mode.value === next) return
   if (next === 'live') resetCall()
   else liveActive.value = false
@@ -123,7 +161,8 @@ watch(
   () => isOpen.value && mode.value === 'live',
   (liveVisible) => {
     if (liveVisible) {
-      if (!liveEnabled.value) void checkHealth()
+      // user came back to the live tab after a failed check → ask again (the open itself already checks once)
+      if (healthResolved.value && !liveEnabled.value) void checkHealth()
       startHealthPolling()
     } else {
       stopHealthPolling()
@@ -229,7 +268,12 @@ function unlock() {
 
 watch(isOpen, async (open) => {
   if (open) {
-    mode.value = 'sim'
+    // Fresh check on every open. A previously-seen "enabled" health shows the live panel right away (optimistic);
+    // otherwise the live tab waits in "연결 확인 중" until the answer arrives (≤ HEALTH_TIMEOUT_MS).
+    healthResolved.value = false
+    autoSwitched.value = false
+    userPickedTab = false
+    mode.value = 'live'
     lock()
     void checkHealth()
     void loadVoicePersonas()
@@ -295,19 +339,8 @@ const stateLabel: Record<CallState, string> = {
             </button>
           </div>
 
-          <!-- Mode switch -->
-          <div class="mt-4 flex items-center gap-1 pb-4" role="tablist" aria-label="데모 방식">
-            <button
-              type="button"
-              role="tab"
-              :aria-selected="mode === 'sim' ? 'true' : 'false'"
-              class="inline-flex items-center gap-1.5 rounded-full px-3.5 py-1.5 text-xs font-semibold transition-colors focus:outline-none focus:ring-2 focus:ring-stone-900 focus:ring-offset-2 sm:text-sm"
-              :class="mode === 'sim' ? 'bg-stone-950 text-white' : 'text-stone-600 hover:bg-stone-100'"
-              data-testid="demo-mode-sim"
-              @click="setMode('sim')"
-            >
-              시뮬레이션
-            </button>
+          <!-- Mode switch: AI 통화 (default) | 대본 미리보기 -->
+          <div class="mt-4 flex items-center gap-1" :class="mode === 'sim' && autoSwitched ? 'pb-2' : 'pb-4'" role="tablist" aria-label="데모 방식">
             <button
               type="button"
               role="tab"
@@ -318,7 +351,7 @@ const stateLabel: Record<CallState, string> = {
               @click="setMode('live')"
             >
               <Radio class="h-3.5 w-3.5" aria-hidden="true" />
-              실제 AI 통화
+              AI 통화
               <span
                 class="rounded-full px-1.5 py-0.5 text-[10px] font-bold leading-none ring-1"
                 :class="mode === 'live'
@@ -331,7 +364,27 @@ const stateLabel: Record<CallState, string> = {
                 GPU
               </span>
             </button>
+            <button
+              type="button"
+              role="tab"
+              :aria-selected="mode === 'sim' ? 'true' : 'false'"
+              class="inline-flex items-center gap-1.5 rounded-full px-3.5 py-1.5 text-xs font-semibold transition-colors focus:outline-none focus:ring-2 focus:ring-stone-900 focus:ring-offset-2 sm:text-sm"
+              :class="mode === 'sim' ? 'bg-stone-950 text-white' : 'text-stone-600 hover:bg-stone-100'"
+              data-testid="demo-mode-sim"
+              @click="setMode('sim')"
+            >
+              대본 미리보기
+            </button>
           </div>
+          <p
+            v-if="mode === 'sim' && autoSwitched"
+            class="flex items-start gap-1.5 pb-3 text-xs leading-5 text-amber-800"
+            role="status"
+            data-testid="demo-live-notice"
+          >
+            <Info class="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+            음성 서버에 연결되지 않아 대본 시뮬레이션으로 보여드립니다.
+          </p>
         </div>
 
         <!-- Body: 시뮬레이션 -->
@@ -447,6 +500,17 @@ const stateLabel: Record<CallState, string> = {
             @active="liveActive = $event"
             @close="emit('close')"
           />
+          <div
+            v-else-if="!healthResolved"
+            class="flex min-h-[320px] flex-col items-center justify-center rounded-2xl border border-stone-200 bg-stone-50 px-6 py-12 text-center"
+            role="status"
+            aria-live="polite"
+            data-testid="live-checking"
+          >
+            <Loader2 class="h-6 w-6 animate-spin text-emerald-600 motion-reduce:animate-none" aria-hidden="true" />
+            <p class="mt-4 text-sm font-semibold text-stone-900">연결 확인 중…</p>
+            <p class="mt-1 text-xs leading-5 text-stone-500">GPU 음성 서버 상태를 확인하고 있습니다</p>
+          </div>
           <LiveUnavailable v-else :reason="liveReason" :checking="healthChecking" @retry="checkHealth" />
         </div>
       </div>

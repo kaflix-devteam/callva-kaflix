@@ -10,7 +10,7 @@ export interface DemoScenario {
 export const demoLabIntro = {
   title: '미니 Demo Lab을 체험해보세요',
   desc: '업종을 고르면 샘플 정보와 통화 방식을 먼저 확인할 수 있습니다.',
-  openLabel: '데모 열기',
+  openLabel: 'AI에게 전화 걸기',
 }
 
 export const demoScenarios: DemoScenario[] = [

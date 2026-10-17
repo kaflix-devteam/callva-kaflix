@@ -4,8 +4,8 @@
  * per-card 미리듣기 control can be a real <button> (buttons cannot nest).
  */
 import { computed } from 'vue'
-import { AlertTriangle, Loader2, Play, Square } from 'lucide-vue-next'
-import type { VoicePersona, VoicePersonasResponse, VoiceSpeedId } from '@/lib/voice/client'
+import { AlertTriangle, Info, Loader2, Play, Square } from 'lucide-vue-next'
+import { personaSupportsSpeed, type VoicePersona, type VoicePersonasResponse, type VoiceSpeedId } from '@/lib/voice/client'
 
 const props = defineProps<{
   catalog: VoicePersonasResponse
@@ -27,6 +27,8 @@ const selected = computed<VoicePersona | null>(
   () => props.catalog.personas.find((p) => p.id === props.persona) ?? props.catalog.personas[0] ?? null,
 )
 const speedLabel = computed(() => props.catalog.speeds.find((s) => s.id === props.speed)?.label ?? '보통')
+const speedSupported = computed(() => personaSupportsSpeed(selected.value))
+const speedDisabled = computed(() => props.disabled || !speedSupported.value)
 
 function select(id: string) {
   if (props.disabled || id === props.persona) return
@@ -98,27 +100,38 @@ function select(id: string) {
 
     <div class="mt-4 flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
       <p class="text-xs font-semibold uppercase tracking-wider text-stone-500">말 빠르기</p>
-      <div class="inline-flex rounded-full bg-stone-100 p-1" role="radiogroup" aria-label="말 빠르기">
+      <div
+        class="inline-flex rounded-full bg-stone-100 p-1"
+        :class="speedSupported ? '' : 'opacity-50'"
+        role="radiogroup"
+        aria-label="말 빠르기"
+        :aria-disabled="speedDisabled ? 'true' : 'false'"
+        data-testid="voice-speed-group"
+      >
         <button
           v-for="s in catalog.speeds"
           :key="s.id"
           type="button"
           role="radio"
           :aria-checked="s.id === speed ? 'true' : 'false'"
-          :disabled="disabled"
+          :disabled="speedDisabled"
           class="rounded-full px-3 py-1 text-xs font-semibold transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-stone-900 disabled:cursor-not-allowed"
           :class="s.id === speed ? 'bg-stone-950 text-white shadow-sm' : 'text-stone-600 hover:text-stone-900'"
           data-testid="voice-speed"
           :data-speed="s.id"
-          @click="!disabled && s.id !== speed && emit('update:speed', s.id)"
+          @click="!speedDisabled && s.id !== speed && emit('update:speed', s.id)"
         >
           {{ s.label }}
         </button>
       </div>
     </div>
+    <p v-if="!speedSupported" class="mt-1.5 flex items-center gap-1.5 text-[11px] leading-4 text-stone-500" data-testid="voice-speed-note">
+      <Info class="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+      이 목소리는 속도 조절을 지원하지 않습니다
+    </p>
 
     <p v-if="selected" class="mt-3 text-xs leading-5 text-stone-600" data-testid="voice-summary">
-      <span class="font-semibold text-stone-900">{{ selected.name }} · 한국어 · {{ speedLabel }}</span>
+      <span class="font-semibold text-stone-900">{{ selected.name }} · 한국어<template v-if="speedSupported"> · {{ speedLabel }}</template></span>
       <span class="text-stone-400"> — </span>
       <span class="italic">“{{ selected.sample }}”</span>
     </p>

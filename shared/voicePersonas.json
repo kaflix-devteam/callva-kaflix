@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "default": "sujin",
   "speeds": [
     {
@@ -33,7 +33,9 @@
       },
       "qwen": {
         "speaker": "Sohee"
-      }
+      },
+      "provider": "qwen",
+      "supportsSpeed": false
     },
     {
       "id": "miyoung",
@@ -49,7 +51,9 @@
       },
       "qwen": {
         "speaker": "Sohee"
-      }
+      },
+      "provider": null,
+      "supportsSpeed": true
     },
     {
       "id": "junho",
@@ -65,7 +69,9 @@
       },
       "qwen": {
         "speaker": "Sohee"
-      }
+      },
+      "provider": null,
+      "supportsSpeed": true
     },
     {
       "id": "sangcheol",
@@ -81,7 +87,9 @@
       },
       "qwen": {
         "speaker": "Sohee"
-      }
+      },
+      "provider": null,
+      "supportsSpeed": true
     }
   ]
 }
