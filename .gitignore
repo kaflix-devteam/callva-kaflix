@@ -25,3 +25,8 @@ dist-ssr
 
 # local API data (form submissions)
 server/data/*.json
+
+# local environment (hosts, keys)
+.env
+.env.*
+!.env.example

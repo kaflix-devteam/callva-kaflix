@@ -7,6 +7,7 @@
  *   POST /api/contact
  *   POST /api/consultation
  *   GET  /api/submissions?type=contact|consultation   (dev only)
+ *   /api/voice/*  — live AI call demo (LLM/TTS/ASR on the GPU server), see routes/voice.mjs
  *
  * In production (NODE_ENV=production) it also serves ../dist with an SPA fallback.
  */
@@ -17,6 +18,16 @@ import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import { validateContact, validateConsultation, validateSubmissionType } from './lib/validate.mjs'
 import { appendRecord, listRecords, DATA_DIR } from './lib/store.mjs'
+import { voiceRouter } from './routes/voice.mjs'
+import { getVoiceConfig } from './lib/voice.mjs'
+
+// Local config (VOICE_* etc.) from the project-root `.env` — gitignored, see .env.example.
+// Variables already present in the environment win over the file. No file → env only.
+try {
+  process.loadEnvFile(fileURLToPath(new URL('../.env', import.meta.url)))
+} catch {
+  /* no .env — fine */
+}
 
 const isProd = process.env.NODE_ENV === 'production'
 const PORT = Number(process.env.PORT ?? 3001)
@@ -28,17 +39,23 @@ app.set('trust proxy', 'loopback')
 
 /* ---------- middleware ---------- */
 app.use(cors())
-app.use(express.json({ limit: '100kb' }))
 
-// tiny request logger: METHOD path → status (ms)
+// tiny request logger: METHOD path → status (ms) [+ whatever a route left in res.locals.log]
 app.use((req, res, next) => {
   const started = process.hrtime.bigint()
   res.on('finish', () => {
     const ms = Number(process.hrtime.bigint() - started) / 1e6
-    console.log(`[api] ${req.method} ${req.originalUrl} → ${res.statusCode} (${ms.toFixed(1)}ms)`)
+    const extra = typeof res.locals.log === 'string' ? ` ${res.locals.log}` : ''
+    console.log(`[api] ${req.method} ${req.originalUrl} → ${res.statusCode} (${ms.toFixed(1)}ms)${extra}`)
   })
   next()
 })
+
+// Voice demo router mounts its own body parsers (12 MB JSON / 8 MB raw WAV),
+// so it must come BEFORE the app-wide 100 KB JSON parser.
+app.use('/api/voice', voiceRouter)
+
+app.use(express.json({ limit: '100kb' }))
 
 /* ---------- helpers ---------- */
 const jitter = (min, max) => Math.round(min + Math.random() * (max - min))
@@ -156,4 +173,8 @@ app.use((err, _req, res, _next) => {
 app.listen(PORT, () => {
   console.log(`[api] listening on http://localhost:${PORT}${isProd ? ' (production)' : ''}`)
   console.log(`[api] submissions are stored in ${DATA_DIR}`)
+  const voice = getVoiceConfig()
+  console.log(voice.configured
+    ? `[api] voice demo enabled (model ${voice.model}) — GET /api/voice/health`
+    : '[api] voice demo disabled — set VOICE_LLM_URL / VOICE_TTS_URL / VOICE_ASR_URL in .env (see .env.example)')
 })
