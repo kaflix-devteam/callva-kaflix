@@ -22,12 +22,50 @@ export class VoiceApiError extends Error {
 
 /* ---------- shapes ---------- */
 
+export type VoiceProvider = 'openai' | 'qwen'
+
 export interface VoiceHealth {
   enabled: boolean
-  llm: { ok: boolean; model?: string; latencyMs?: number; error?: string }
-  tts: { ok: boolean; latencyMs?: number; speaker?: string; error?: string }
-  asr: { ok: boolean; latencyMs?: number; error?: string }
+  llm: { ok: boolean; model?: string; latencyMs?: number; error?: string; provider?: VoiceProvider }
+  tts: { ok: boolean; latencyMs?: number; speaker?: string; error?: string; provider?: VoiceProvider; model?: string }
+  asr: { ok: boolean; latencyMs?: number; error?: string; provider?: VoiceProvider; model?: string }
+  /** which backend serves each stage (newer servers only) */
+  providers?: { asr: VoiceProvider; llm: VoiceProvider; tts: VoiceProvider }
+  openai?: { ok: boolean; latencyMs?: number; error?: string }
   checkedAt: string
+}
+
+/* ---------- voice personas (목소리 / 말 빠르기) ---------- */
+
+export type VoiceSpeedId = 'slow' | 'normal' | 'fast'
+
+export interface VoiceSpeed {
+  id: VoiceSpeedId
+  label: string
+  factor: number
+}
+
+export interface VoicePersona {
+  id: string
+  name: string
+  tagline: string
+  sample: string
+  gender: string
+  /** only present when served by the API */
+  provider?: VoiceProvider
+  voice?: string
+}
+
+export interface VoicePersonasResponse {
+  default: string
+  speeds: VoiceSpeed[]
+  personas: VoicePersona[]
+}
+
+/** What the browser sends with /tts and /turn — exactly these two keys. */
+export interface VoiceSelection {
+  persona: string
+  speed: VoiceSpeedId
 }
 
 export interface VoiceScenario {
@@ -58,20 +96,23 @@ export interface VoiceTurnRequest {
   /** base64 of a WAV file (≤ 8 MB, ≤ 30 s) — exactly one of text / audioBase64 */
   audioBase64?: string
   history?: VoiceHistoryItem[]
+  voice?: VoiceSelection
 }
 
 export interface VoiceTimings {
-  asrMs?: number
-  llmMs: number
-  ttsMs?: number
-  totalMs: number
+  asrMs?: number | null
+  llmMs: number | null
+  ttsMs?: number | null
+  totalMs: number | null
   ttsError?: string
+  providers?: { asr?: VoiceProvider; llm?: VoiceProvider; tts?: VoiceProvider }
 }
 
 export interface VoiceAudio {
   base64: string
   mime: string
   seconds: number
+  voice?: { persona: string; provider: VoiceProvider; voice: string }
 }
 
 export interface VoiceTurnResponse {
@@ -145,6 +186,11 @@ export function fetchVoiceScenarios(signal?: AbortSignal): Promise<VoiceScenario
   return requestJson<VoiceScenariosResponse>('/api/voice/scenarios', { signal })
 }
 
+/** GET /api/voice/personas — 404 (older server) → VoiceApiError(reachable=false); callers fall back to the local JSON. */
+export function fetchVoicePersonas(signal?: AbortSignal): Promise<VoicePersonasResponse> {
+  return requestJson<VoicePersonasResponse>('/api/voice/personas', { signal, cache: 'no-store' })
+}
+
 /** POST /api/voice/turn — one text OR audio turn; returns reply + optional WAV. */
 export function postVoiceTurn(body: VoiceTurnRequest, signal?: AbortSignal): Promise<VoiceTurnResponse> {
   return requestJson<VoiceTurnResponse>('/api/voice/turn', {
@@ -155,12 +201,15 @@ export function postVoiceTurn(body: VoiceTurnRequest, signal?: AbortSignal): Pro
 }
 
 /** POST /api/voice/tts — returns the WAV body (as base64 so the player has one input form). */
-export async function fetchVoiceTts(text: string, signal?: AbortSignal): Promise<VoiceTtsResult> {
+export async function fetchVoiceTts(
+  text: string,
+  options: { voice?: VoiceSelection; signal?: AbortSignal } = {},
+): Promise<VoiceTtsResult> {
   const res = await doFetch('/api/voice/tts', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'audio/wav, application/json' },
-    body: JSON.stringify({ text }),
-    signal,
+    body: JSON.stringify(options.voice ? { text, voice: options.voice } : { text }),
+    signal: options.signal,
   })
   const contentType = res.headers.get('content-type') ?? ''
   if (!res.ok || contentType.includes('application/json')) {
@@ -198,9 +247,20 @@ export function describeVoiceUnavailable(health: VoiceHealth | null, error: unkn
   return 'GPU 서버가 아직 준비되지 않았습니다.'
 }
 
-/** "qwen3.5:4b · Qwen3-TTS · Qwen3-ASR" style one-liner for the header. */
-export function describeVoiceModels(health: VoiceHealth | null): string {
+/**
+ * Model one-liner for the header. Newer servers report `providers` + per-stage models
+ * (e.g. "gpt-4.1-mini · gpt-4o-mini-tts(coral) · gpt-4o-mini-transcribe"); older ones
+ * only expose the Qwen stack.
+ */
+export function describeVoiceModels(health: VoiceHealth | null, persona?: VoicePersona | null): string {
   if (!health) return ''
+  if (health.providers || health.llm?.provider || health.tts?.provider) {
+    const ttsVoice = health.tts?.provider === 'openai' ? persona?.voice : health.tts?.speaker
+    const llm = health.llm?.model || (health.providers?.llm === 'openai' ? 'OpenAI LLM' : 'qwen3.5:4b')
+    const tts = (health.tts?.model || (health.providers?.tts === 'openai' ? 'OpenAI TTS' : 'Qwen3-TTS')) + (ttsVoice ? `(${ttsVoice})` : '')
+    const asr = health.asr?.model || (health.providers?.asr === 'openai' ? 'OpenAI ASR' : 'Qwen3-ASR')
+    return [llm, tts, asr].join(' · ')
+  }
   const parts = [health.llm?.model || 'LLM', health.tts?.speaker ? `Qwen3-TTS (${health.tts.speaker})` : 'Qwen3-TTS', 'Qwen3-ASR']
   return parts.join(' · ')
 }

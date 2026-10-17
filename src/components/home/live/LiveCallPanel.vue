@@ -41,7 +41,11 @@ import {
   postVoiceTurn,
   type VoiceHealth,
   type VoiceHistoryItem,
+  type VoicePersona,
+  type VoicePersonasResponse,
   type VoiceScenario,
+  type VoiceSelection,
+  type VoiceSpeedId,
   type VoiceTimings,
 } from '@/lib/voice/client'
 import { arrayBufferToBase64, encodeWav } from '@/lib/voice/wav'
@@ -50,11 +54,14 @@ import { WavPlayer } from '@/lib/voice/player'
 import { Vad, rmsToLevel } from '@/lib/voice/vad'
 import MicButton from './MicButton.vue'
 import LevelMeter from './LevelMeter.vue'
+import VoicePicker from './VoicePicker.vue'
 
 const props = defineProps<{
   scenario: DemoScenario
   voice: VoiceScenario | null
   health: VoiceHealth | null
+  /** 목소리/말 빠르기 catalog (local JSON until /api/voice/personas answers) */
+  catalog: VoicePersonasResponse
 }>()
 const emit = defineEmits<{ close: []; active: [value: boolean] }>()
 
@@ -123,6 +130,15 @@ const micLevel = ref(0)
 const micDenied = ref(false)
 const micSupported = isRecorderSupported()
 
+// voice persona / speed (chosen before the call; locked while in a call)
+const personaId = ref(props.catalog.default)
+const speedId = ref<VoiceSpeedId>('normal')
+const previewing = ref<string | null>(null)
+const previewLoading = ref(false)
+const previewError = ref<string | null>(null)
+let previewToken = 0
+let previewAbort: AbortController | null = null
+
 const logEl = ref<HTMLElement | null>(null)
 const audioEl = ref<HTMLAudioElement | null>(null)
 const inputEl = ref<HTMLInputElement | null>(null)
@@ -150,7 +166,12 @@ const micOk = computed(() => micSupported && !micDenied.value && props.health?.a
 const handsFreeOn = computed(() => handsFree.value && micOk.value)
 const showComposer = computed(() => !handsFreeOn.value || composerOpen.value)
 const micTitle = computed(() => (micOk.value ? '누른 채 말하기 (Space)' : MIC_TOOLTIP))
-const modelInfo = computed(() => describeVoiceModels(props.health))
+const selectedPersona = computed<VoicePersona | null>(
+  () => props.catalog.personas.find((p) => p.id === personaId.value) ?? props.catalog.personas[0] ?? null,
+)
+const voiceSelection = computed<VoiceSelection>(() => ({ persona: selectedPersona.value?.id ?? personaId.value, speed: speedId.value }))
+const personaChip = computed(() => (selectedPersona.value ? `${selectedPersona.value.name} · ${selectedPersona.value.tagline}` : ''))
+const modelInfo = computed(() => describeVoiceModels(props.health, selectedPersona.value))
 const facts = computed(() => props.voice?.facts ?? [])
 const greeting = computed(
   () => props.voice?.greeting ?? `안녕하세요, 콜바 ${props.scenario.industry}입니다. 무엇을 도와드릴까요?`,
@@ -388,9 +409,52 @@ function toggleHandsFree() {
   if (inCall.value && !busy.value && phase.value !== 'speaking' && !recording.value) void startListening()
 }
 
+/* ---------- voice preview (before the call only) ---------- */
+function stopPreview() {
+  ++previewToken
+  previewAbort?.abort()
+  previewAbort = null
+  if (previewing.value !== null) player?.stop()
+  previewing.value = null
+  previewLoading.value = false
+}
+
+async function previewVoice(id: string) {
+  if (inCall.value) return
+  if (previewing.value === id) {
+    stopPreview()
+    return
+  }
+  const persona = props.catalog.personas.find((p) => p.id === id)
+  if (!persona) return
+  stopPreview()
+  const token = previewToken
+  const controller = new AbortController()
+  previewAbort = controller
+  previewError.value = null
+  previewing.value = id
+  previewLoading.value = true
+  try {
+    const tts = await fetchVoiceTts(persona.sample, { voice: { persona: id, speed: speedId.value }, signal: controller.signal })
+    if (token !== previewToken) return
+    previewLoading.value = false
+    await player?.play(tts.base64, tts.mime)
+    if (token !== previewToken) return
+    previewing.value = null
+  } catch (err) {
+    if (token !== previewToken || isAbort(err)) return
+    previewing.value = null
+    previewLoading.value = false
+    previewError.value = `미리듣기 실패: ${errorText(err)}`
+  } finally {
+    if (token === previewToken) previewAbort = null
+  }
+}
+
 /* ---------- call lifecycle ---------- */
 async function startCall() {
   const token = ++seq
+  stopPreview()
   abortTurn()
   player?.stop()
   stopListening()
@@ -417,7 +481,7 @@ async function startCall() {
   const text = greeting.value
   const controller = new AbortController()
   turnAbort = controller
-  const ttsPromise = fetchVoiceTts(text, controller.signal)
+  const ttsPromise = fetchVoiceTts(text, { voice: voiceSelection.value, signal: controller.signal })
 
   try {
     await micPrep
@@ -430,7 +494,11 @@ async function startCall() {
     const tts = await ttsPromise
     if (token !== seq) return
     turnAbort = null
-    const caption = [tts.elapsedMs ? `TTS ${fmtMs(tts.elapsedMs)}` : null, tts.seconds ? `${tts.seconds.toFixed(1)}s` : null]
+    const caption = [
+      tts.elapsedMs ? `TTS ${fmtMs(tts.elapsedMs)}` : null,
+      tts.seconds ? `${tts.seconds.toFixed(1)}s` : null,
+      selectedPersona.value?.name ?? null,
+    ]
       .filter(Boolean)
       .join(' · ')
     push({ role: 'assistant', text, caption, pending: false, warn: false })
@@ -514,6 +582,7 @@ async function runTurn(input: TurnInput) {
         scenarioId: props.scenario.id,
         ...(isAudio ? { audioBase64: input.audioBase64 } : { text: input.text }),
         ...(history.value.length ? { history: history.value } : {}),
+        voice: voiceSelection.value,
       },
       controller.signal,
     )
@@ -531,7 +600,7 @@ async function runTurn(input: TurnInput) {
     push({
       role: 'assistant',
       text: res.reply,
-      caption: formatTimings(timings),
+      caption: [formatTimings(timings), res.audio?.voice?.voice ?? null].filter(Boolean).join(' · '),
       pending: false,
       warn: !!timings.ttsError || !res.audio,
     })
@@ -678,6 +747,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   ++seq
+  stopPreview()
   abortTurn()
   player?.stop()
   stopListening()
@@ -716,6 +786,7 @@ watch(phase, () => scrollLog())
               <span :class="ui.chip">{{ scenario.industry }}</span>
               <span v-if="scenario.outbound" :class="ui.chipAmber">아웃바운드</span>
               <span :class="ui.chipEmerald">GPU</span>
+              <span v-if="inCall && selectedPersona" :class="ui.chip" data-testid="live-persona-chip">{{ selectedPersona.name }}</span>
             </div>
             <p class="mt-1 truncate text-sm font-semibold text-stone-950">{{ scenario.title }}</p>
             <p v-if="modelInfo" class="mt-0.5 truncate text-[11px] text-stone-400" data-testid="live-models">{{ modelInfo }}</p>
@@ -774,13 +845,14 @@ watch(phase, () => scrollLog())
         </div>
       </div>
 
-      <!-- Idle / start screen -->
-      <div v-if="!inCall" class="flex flex-1 flex-col items-center justify-center px-6 py-10 text-center">
-        <span class="inline-flex h-14 w-14 items-center justify-center rounded-full bg-emerald-600 text-white shadow-lg shadow-emerald-900/20">
-          <component :is="scenario.outbound ? PhoneOutgoing : PhoneCall" class="h-6 w-6" aria-hidden="true" />
-        </span>
-        <p v-if="ended" class="mt-5 text-sm font-semibold text-stone-900">통화가 종료되었습니다</p>
-        <p class="mt-2 text-sm leading-6 text-stone-600">
+      <!-- Idle / start screen: voice picker + 통화 시작 -->
+      <div v-if="!inCall" class="flex flex-1 flex-col px-4 py-5 sm:px-5">
+        <div class="flex flex-col items-center text-center">
+          <span class="inline-flex h-12 w-12 items-center justify-center rounded-full bg-emerald-600 text-white shadow-lg shadow-emerald-900/20">
+            <component :is="scenario.outbound ? PhoneOutgoing : PhoneCall" class="h-5 w-5" aria-hidden="true" />
+          </span>
+          <p v-if="ended" class="mt-4 text-sm font-semibold text-stone-900">통화가 종료되었습니다</p>
+          <p class="mt-2 text-sm leading-6 text-stone-600">
           <template v-if="ended">같은 시나리오로 다시 시작하거나 데모를 닫을 수 있습니다.</template>
           <template v-else-if="handsFreeOn">
             버튼을 누르면 마이크 권한을 묻고 AI 상담원이 먼저 인사합니다.<br />
@@ -794,8 +866,23 @@ watch(phase, () => scrollLog())
             버튼을 누르면 AI 상담원이 먼저 인사합니다.<br />
             텍스트로 대화해 보세요.
           </template>
-        </p>
-        <div class="mt-6 flex flex-wrap items-center justify-center gap-3">
+          </p>
+        </div>
+
+        <VoicePicker
+          class="mt-5"
+          :catalog="catalog"
+          :persona="personaId"
+          :speed="speedId"
+          :previewing="previewing"
+          :preview-loading="previewLoading"
+          :preview-error="previewError"
+          @update:persona="personaId = $event"
+          @update:speed="speedId = $event"
+          @preview="previewVoice"
+        />
+
+        <div class="mt-5 flex flex-wrap items-center justify-center gap-3">
           <button type="button" :class="ui.btnPrimary" data-testid="live-start" @click="startCall">
             <PhoneCall class="h-4 w-4" aria-hidden="true" />
             {{ ended ? '다시 통화 시작' : '통화 시작' }}
@@ -884,6 +971,9 @@ watch(phase, () => scrollLog())
           :data-strip="strip"
           :data-threshold="vadThreshold ?? ''"
         >
+          <span v-if="personaChip" class="order-last basis-full text-[11px] text-stone-400 sm:order-none sm:basis-auto" data-testid="live-strip-persona">
+            <span :class="ui.chip">{{ personaChip }}</span>
+          </span>
           <template v-if="strip === 'listening' || strip === 'speech'">
             <div class="flex min-w-0 items-center gap-3">
               <span

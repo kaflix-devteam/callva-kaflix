@@ -174,7 +174,8 @@ app.listen(PORT, () => {
   console.log(`[api] listening on http://localhost:${PORT}${isProd ? ' (production)' : ''}`)
   console.log(`[api] submissions are stored in ${DATA_DIR}`)
   const voice = getVoiceConfig()
+  const svc = (kind) => `${kind}=${voice.providers[kind]}${voice.models[kind] ? `:${voice.models[kind]}` : ''}`
   console.log(voice.configured
-    ? `[api] voice demo enabled (model ${voice.model}) — GET /api/voice/health`
-    : '[api] voice demo disabled — set VOICE_LLM_URL / VOICE_TTS_URL / VOICE_ASR_URL in .env (see .env.example)')
+    ? `[api] voice demo enabled — ${svc('llm')} ${svc('tts')} ${svc('asr')}${voice.ready.asr ? '' : ' (asr not configured → text input only)'} — GET /api/voice/health`
+    : '[api] voice demo disabled — set OPENAI_API_KEY or VOICE_LLM_URL / VOICE_TTS_URL / VOICE_ASR_URL in .env (see .env.example)')
 })

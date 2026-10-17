@@ -4,8 +4,16 @@ import { Bot, CheckCircle2, PhoneCall, PhoneOutgoing, Radio, RotateCcw, User, X 
 import type { DemoScenario } from '@/data/demoScenarios'
 import { demoTranscripts, type TranscriptLine } from '@/data/demoTranscripts'
 import { ui } from '@/lib/ui'
-import { describeVoiceUnavailable, fetchVoiceHealth, type VoiceHealth, type VoiceScenario } from '@/lib/voice/client'
+import {
+  describeVoiceUnavailable,
+  fetchVoiceHealth,
+  fetchVoicePersonas,
+  type VoiceHealth,
+  type VoicePersonasResponse,
+  type VoiceScenario,
+} from '@/lib/voice/client'
 import voiceScenarios from '@shared/voiceScenarios.json'
+import voicePersonas from '@shared/voicePersonas.json'
 import LiveCallPanel from './live/LiveCallPanel.vue'
 import LiveUnavailable from './live/LiveUnavailable.vue'
 
@@ -29,6 +37,31 @@ const voiceEntry = computed<VoiceScenario | null>(() => {
   if (!id) return null
   return (voiceScenarios.scenarios as VoiceScenario[]).find((s) => s.id === id) ?? null
 })
+
+/* ---------- voice personas (local JSON first, API when it answers) ---------- */
+function localVoiceCatalog(): VoicePersonasResponse {
+  // Narrow to the contract shape — openai/qwen/style fields are server-side only.
+  return {
+    default: voicePersonas.default,
+    speeds: voicePersonas.speeds.map((s) => ({ id: s.id as VoicePersonasResponse['speeds'][number]['id'], label: s.label, factor: s.factor })),
+    personas: voicePersonas.personas.map(({ id, name, tagline, sample, gender }) => ({ id, name, tagline, sample, gender })),
+  }
+}
+const voiceCatalog = ref<VoicePersonasResponse>(localVoiceCatalog())
+let personasFetched = false
+
+async function loadVoicePersonas() {
+  if (personasFetched) return
+  try {
+    const res = await fetchVoicePersonas()
+    if (Array.isArray(res.personas) && res.personas.length > 0 && Array.isArray(res.speeds) && res.speeds.length > 0) {
+      voiceCatalog.value = res
+      personasFetched = true
+    }
+  } catch {
+    /* older server / tunnel down → keep the local catalog */
+  }
+}
 
 /* ---------- live health ---------- */
 const health = ref<VoiceHealth | null>(null)
@@ -199,6 +232,7 @@ watch(isOpen, async (open) => {
     mode.value = 'sim'
     lock()
     void checkHealth()
+    void loadVoicePersonas()
     await nextTick()
     closeBtn.value?.focus()
   } else {
@@ -409,6 +443,7 @@ const stateLabel: Record<CallState, string> = {
             :scenario="scenario"
             :voice="voiceEntry"
             :health="health"
+            :catalog="voiceCatalog"
             @active="liveActive = $event"
             @close="emit('close')"
           />
