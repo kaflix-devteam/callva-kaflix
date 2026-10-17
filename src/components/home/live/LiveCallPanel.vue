@@ -2,12 +2,36 @@
 /**
  * "실제 AI 통화" — browser side of the live demo.
  *
- * One turn = POST /api/voice/turn (ASR → LLM → TTS on the GPU server). The server
- * does not stream progress, so the 인식 중 → 생각 중 transition shown while an
- * audio turn is in flight is a client-side estimate (~1.2 s), not a server event.
+ * Default = hands-free call: 통화 시작 opens the mic ONCE (one permission prompt,
+ * stream kept open for the whole call), plays the greeting, then listens
+ * continuously. An RMS VAD (src/lib/voice/vad.ts) decides when an utterance
+ * starts/ends; the clip is encoded to 16 kHz WAV and sent to POST /api/voice/turn,
+ * the reply is played (mic input gated/ignored meanwhile), then we listen again —
+ * until 통화 종료. The VAD calibrates once per call (first listen; again only after
+ * a 30 s idle pause via 다시 듣기) and keeps its threshold across cycles.
+ * Hands-free off = hold-to-talk + text composer. Tracks are stopped only on
+ * 통화 종료 / modal close / tab switch / unmount.
+ *
+ * The server does not stream progress, so the 인식 중 → 생각 중 transition shown
+ * while an audio turn is in flight is a client-side estimate (~1.2 s).
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { AlertTriangle, Bot, ChevronDown, PhoneCall, PhoneOff, PhoneOutgoing, SendHorizontal, User, X } from 'lucide-vue-next'
+import {
+  AlertTriangle,
+  Bot,
+  ChevronDown,
+  Headphones,
+  Keyboard,
+  Mic,
+  PhoneCall,
+  PhoneOff,
+  PhoneOutgoing,
+  RotateCcw,
+  SendHorizontal,
+  User,
+  Volume2,
+  X,
+} from 'lucide-vue-next'
 import type { DemoScenario } from '@/data/demoScenarios'
 import { ui } from '@/lib/ui'
 import {
@@ -23,7 +47,9 @@ import {
 import { arrayBufferToBase64, encodeWav } from '@/lib/voice/wav'
 import { MicRecorder, describeMicError, isRecorderSupported } from '@/lib/voice/recorder'
 import { WavPlayer } from '@/lib/voice/player'
+import { Vad, rmsToLevel } from '@/lib/voice/vad'
 import MicButton from './MicButton.vue'
+import LevelMeter from './LevelMeter.vue'
 
 const props = defineProps<{
   scenario: DemoScenario
@@ -33,10 +59,18 @@ const props = defineProps<{
 const emit = defineEmits<{ close: []; active: [value: boolean] }>()
 
 /* ---------- constants ---------- */
-const MAX_RECORD_MS = 15_000
-const MIN_RECORD_SEC = 0.3
+const MAX_RECORD_MS = 15_000 // hold-to-talk hard stop
+const MIN_HOLD_SEC = 0.3 // hold-to-talk minimum
+const MIN_UTTERANCE_SEC = 0.4 // hands-free minimum speech length
+const PRE_ROLL_MS = 400 // audio kept before the detected onset
 const ASR_ESTIMATE_MS = 1_200
+const RELISTEN_DELAY_MS = 400 // let the speaker tail die before listening again
+const VAD_FALLBACK_THRESHOLD = 0.02
+const ERROR_RELISTEN_MS = 1_500
+const HINT_AFTER_MS = 12_000
+const IDLE_STOP_MS = 30_000
 const MIC_TOOLTIP = '마이크를 사용할 수 없어 텍스트로만 대화합니다'
+const TEXT_FALLBACK_NOTICE = '마이크를 쓸 수 없어 텍스트 모드로 진행합니다.'
 
 /* ---------- state ---------- */
 type Phase = 'idle' | 'connecting' | 'listening' | 'recognizing' | 'thinking' | 'speaking' | 'error'
@@ -65,14 +99,27 @@ const phase = ref<Phase>('idle')
 const bubbles = ref<Bubble[]>([])
 const history = ref<VoiceHistoryItem[]>([])
 const errorMsg = ref<string | null>(null)
+const notice = ref<string | null>(null)
 const hint = ref<string | null>(null)
 const draft = ref('')
 const turns = ref(0)
 
+// hands-free
+const handsFree = ref(true)
+const listening = ref(false)
+const listenPaused = ref(false)
+const speechDetected = ref(false)
+const speechSec = ref(0)
+const level = ref(0)
+const vadThreshold = ref<number | null>(null)
+const composerOpen = ref(false)
+
+// hold-to-talk
 const recording = ref(false)
 const recProgress = ref(0)
 const recElapsed = ref(0)
 const micLevel = ref(0)
+
 const micDenied = ref(false)
 const micSupported = isRecorderSupported()
 
@@ -82,24 +129,27 @@ const inputEl = ref<HTMLInputElement | null>(null)
 
 let player: WavPlayer | null = null
 const recorder = new MicRecorder()
-recorder.onlevel = (level) => {
-  micLevel.value = Math.min(1, level * 5)
-}
+/** One VAD per call; recreated (recalibrated) only on 다시 듣기 after an idle pause. */
+let vad: Vad | null = null
 
-/** Monotonic token: every start / end / turn / recording bumps it so stale async work is ignored. */
+/** Monotonic token: every start / end / turn / listen cycle bumps it so stale async work is ignored. */
 let seq = 0
 let turnAbort: AbortController | null = null
 let bubbleId = 0
+let phaseTimer: ReturnType<typeof setTimeout> | null = null
+let hintTimer: ReturnType<typeof setTimeout> | null = null
+let idleTimer: ReturnType<typeof setTimeout> | null = null
 let recTimer: ReturnType<typeof setInterval> | null = null
 let recStartedAt = 0
 let pressActive = false
-let phaseTimer: ReturnType<typeof setTimeout> | null = null
 
 /* ---------- derived ---------- */
 const busy = computed(() => phase.value === 'connecting' || phase.value === 'recognizing' || phase.value === 'thinking')
 const canCompose = computed(() => inCall.value && !busy.value && !recording.value)
-const micAvailable = computed(() => micSupported && !micDenied.value && props.health?.asr?.ok !== false)
-const micTitle = computed(() => (micAvailable.value ? '누른 채 말하기 (Space)' : MIC_TOOLTIP))
+const micOk = computed(() => micSupported && !micDenied.value && props.health?.asr?.ok !== false)
+const handsFreeOn = computed(() => handsFree.value && micOk.value)
+const showComposer = computed(() => !handsFreeOn.value || composerOpen.value)
+const micTitle = computed(() => (micOk.value ? '누른 채 말하기 (Space)' : MIC_TOOLTIP))
 const modelInfo = computed(() => describeVoiceModels(props.health))
 const facts = computed(() => props.voice?.facts ?? [])
 const greeting = computed(
@@ -121,6 +171,18 @@ const pillClass = computed(() => {
   }
 })
 const showDots = computed(() => busy.value)
+/** Hands-free status strip under the transcript. */
+const strip = computed<'listening' | 'speech' | 'busy' | 'speaking' | 'paused' | 'resume' | null>(() => {
+  if (!inCall.value) return null
+  // phase flips to 'listening' before the mic finishes opening — show the strip right away (level 0) to avoid a flicker
+  if (listening.value || (phase.value === 'listening' && handsFreeOn.value)) return speechDetected.value ? 'speech' : 'listening'
+  if (busy.value) return 'busy'
+  if (phase.value === 'speaking') return 'speaking'
+  if (!handsFreeOn.value) return null
+  if (listenPaused.value) return 'paused'
+  if (phase.value === 'idle' || phase.value === 'error') return 'resume'
+  return null
+})
 
 /* ---------- helpers ---------- */
 function fmtMs(ms: number | undefined | null): string | null {
@@ -170,17 +232,160 @@ function setError(message: string) {
   phase.value = 'error'
 }
 
-function clearPhaseTimer() {
-  if (phaseTimer !== null) {
-    clearTimeout(phaseTimer)
-    phaseTimer = null
-  }
+function clearTimer(handle: ReturnType<typeof setTimeout> | null) {
+  if (handle !== null) clearTimeout(handle)
+  return null
 }
 
 function abortTurn() {
   turnAbort?.abort()
   turnAbort = null
-  clearPhaseTimer()
+  phaseTimer = clearTimer(phaseTimer)
+}
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+
+/** Mic failed → remember, tell the user, fall back to the text composer. */
+function fallbackToText(err: unknown) {
+  const info = describeMicError(err)
+  if (info.denied) micDenied.value = true
+  notice.value = `${TEXT_FALLBACK_NOTICE} (${info.message})`
+  composerOpen.value = true
+}
+
+/* ---------- hands-free listening ---------- */
+function clearIdleTimers() {
+  hintTimer = clearTimer(hintTimer)
+  idleTimer = clearTimer(idleTimer)
+}
+
+function scheduleIdleTimers(token: number) {
+  clearIdleTimers()
+  hintTimer = setTimeout(() => {
+    if (token === seq && listening.value && !speechDetected.value) hint.value = '말씀하시면 자동으로 인식됩니다'
+  }, HINT_AFTER_MS)
+  idleTimer = setTimeout(() => {
+    if (token === seq && listening.value && !speechDetected.value) pauseListening()
+  }, IDLE_STOP_MS)
+}
+
+/** Gate the mic (input ignored) and stop feeding the VAD. The stream stays open. */
+function stopListening() {
+  clearIdleTimers()
+  recorder.onLevel = null
+  recorder.cancel() // drop any partial capture + pause
+  listening.value = false
+  speechDetected.value = false
+  speechSec.value = 0
+  level.value = 0
+}
+
+/** 30 s without speech: stop so requests do not keep flowing while nobody is there. */
+function pauseListening() {
+  stopListening()
+  listenPaused.value = true
+  phase.value = 'idle'
+  hint.value = '응답이 없어 듣기를 멈췄습니다.'
+}
+
+async function startListening(options: { recalibrate?: boolean } = {}) {
+  if (!inCall.value || !handsFreeOn.value) return
+  const token = ++seq
+  abortTurn()
+  player?.stop()
+  stopListening()
+  listenPaused.value = false
+  hint.value = null
+  phase.value = 'listening'
+
+  if (!recorder.isOpen) {
+    // normally opened in 통화 시작; happens when hands-free was switched on mid-call
+    try {
+      await recorder.open({ preRollMs: PRE_ROLL_MS })
+    } catch (err) {
+      if (token !== seq) return
+      fallbackToText(err)
+      phase.value = 'idle'
+      return
+    }
+    if (token !== seq || !handsFreeOn.value || !inCall.value) {
+      // call ended / hands-free switched off / mic lost while the mic was opening
+      recorder.pause()
+      if (token === seq && phase.value === 'listening') phase.value = 'idle'
+      return
+    }
+  }
+
+  // Calibrate once per call; later cycles reuse the threshold (reset state only).
+  if (!vad || options.recalibrate) {
+    vad = new Vad({ fallbackThreshold: vadThreshold.value ?? VAD_FALLBACK_THRESHOLD })
+    vadThreshold.value = vad.threshold > 0 ? vad.threshold : null
+  } else {
+    vad.reset()
+  }
+  const activeVad = vad
+  recorder.resume() // empty pre-roll ring → no speaker tail in the next capture
+  listening.value = true
+  recorder.onLevel = (rms, t) => {
+    if (token !== seq) return
+    level.value = rmsToLevel(rms)
+    const ev = activeVad.feed(rms, t)
+    if (activeVad.state === 'speaking') speechSec.value = activeVad.speechSecAt(t)
+    if (!ev) return
+
+    if (ev.type === 'calibrated') {
+      vadThreshold.value = ev.threshold
+      return
+    }
+    if (ev.type === 'onset') {
+      speechDetected.value = true
+      hint.value = null
+      recorder.beginCapture()
+      clearIdleTimers()
+      return
+    }
+    if (ev.type === 'end') {
+      speechDetected.value = false
+      speechSec.value = 0
+      const rec = recorder.endCapture()
+      // Too short / too quiet → ASR tends to hallucinate text; keep listening instead.
+      if (ev.speechSec < MIN_UTTERANCE_SEC || ev.peak < activeVad.threshold || rec.samples.length === 0) {
+        activeVad.reset()
+        scheduleIdleTimers(token)
+        return
+      }
+      stopListening() // input gated during ASR/LLM/TTS and playback (stream stays open)
+      const wav = encodeWav(rec.samples, rec.sampleRate)
+      void runTurn({ audioBase64: arrayBufferToBase64(wav), seconds: rec.seconds })
+    }
+  }
+  scheduleIdleTimers(token)
+}
+
+/** After a reply (or an error) decide what to do next in hands-free mode. */
+async function afterTurn(token: number, delayMs: number) {
+  if (!inCall.value || token !== seq) return
+  if (handsFreeOn.value && !listenPaused.value) {
+    await sleep(delayMs)
+    if (token !== seq || !inCall.value) return
+    void startListening()
+  } else if (phase.value !== 'error') {
+    phase.value = 'idle'
+  }
+}
+
+function toggleHandsFree() {
+  if (!micOk.value) return
+  handsFree.value = !handsFree.value
+  if (!handsFree.value) {
+    stopListening()
+    if (phase.value === 'listening') phase.value = 'idle'
+    listenPaused.value = false
+    composerOpen.value = true
+    return
+  }
+  composerOpen.value = false
+  if (inCall.value && !busy.value && phase.value !== 'speaking' && !recording.value) void startListening()
 }
 
 /* ---------- call lifecycle ---------- */
@@ -188,22 +393,41 @@ async function startCall() {
   const token = ++seq
   abortTurn()
   player?.stop()
+  stopListening()
   bubbles.value = []
   history.value = []
   errorMsg.value = null
+  notice.value = null
   hint.value = null
   turns.value = 0
   ended.value = false
+  listenPaused.value = false
   inCall.value = true
   phase.value = 'connecting'
   emit('active', true)
   player?.prime()
+  vad = null
+  vadThreshold.value = null
 
+  // Permission + AudioContext unlock must start inside the click (before any await).
+  // The stream is opened once here and kept for the whole call (gated while not listening).
+  const micPrep = handsFreeOn.value
+    ? recorder.open({ preRollMs: PRE_ROLL_MS }).then(() => recorder.pause())
+    : Promise.resolve()
   const text = greeting.value
   const controller = new AbortController()
   turnAbort = controller
+  const ttsPromise = fetchVoiceTts(text, controller.signal)
+
   try {
-    const tts = await fetchVoiceTts(text, controller.signal)
+    await micPrep
+  } catch (err) {
+    if (token !== seq) return
+    fallbackToText(err)
+  }
+
+  try {
+    const tts = await ttsPromise
     if (token !== seq) return
     turnAbort = null
     const caption = [tts.elapsedMs ? `TTS ${fmtMs(tts.elapsedMs)}` : null, tts.seconds ? `${tts.seconds.toFixed(1)}s` : null]
@@ -212,14 +436,17 @@ async function startCall() {
     push({ role: 'assistant', text, caption, pending: false, warn: false })
     phase.value = 'speaking'
     await player?.play(tts.base64, tts.mime)
-    if (token === seq && phase.value === 'speaking') phase.value = 'idle'
-    focusInput()
+    if (token !== seq) return
+    if (phase.value === 'speaking') phase.value = 'idle'
+    await afterTurn(token, RELISTEN_DELAY_MS)
+    if (token === seq && !handsFreeOn.value) focusInput()
   } catch (err) {
     if (token !== seq || isAbort(err)) return
     turnAbort = null
-    // Greeting voice failed — still show the text so the text conversation can continue.
+    // Greeting voice failed — still show the text so the conversation can continue.
     if (bubbles.value.length === 0) push({ role: 'assistant', text, caption: '음성 합성 실패 · 텍스트로 진행', pending: false, warn: true })
     setError(errorText(err))
+    void afterTurn(token, ERROR_RELISTEN_MS)
   }
 }
 
@@ -227,15 +454,22 @@ function endCall() {
   ++seq
   abortTurn()
   player?.stop()
+  stopListening()
   if (recording.value || pressActive) cancelRecording()
+  recorder.close() // tracks stop only here / on unmount
+  vad = null
+  vadThreshold.value = null
   const hadTurns = bubbles.value.length > 0
   inCall.value = false
   emit('active', false)
   ended.value = hadTurns
   phase.value = 'idle'
   errorMsg.value = null
+  notice.value = null
   hint.value = null
   draft.value = ''
+  listenPaused.value = false
+  composerOpen.value = false
   bubbles.value = []
   history.value = []
 }
@@ -252,6 +486,8 @@ async function runTurn(input: TurnInput) {
   const token = ++seq
   abortTurn()
   player?.stop()
+  stopListening()
+  listenPaused.value = false // any turn (incl. typed text) proves the user is present → auto-listen may resume after the reply
   errorMsg.value = null
   hint.value = null
 
@@ -283,7 +519,7 @@ async function runTurn(input: TurnInput) {
     )
     if (token !== seq) return
     turnAbort = null
-    clearPhaseTimer()
+    phaseTimer = clearTimer(phaseTimer)
 
     userBubble.pending = false
     if (isAudio) {
@@ -307,19 +543,25 @@ async function runTurn(input: TurnInput) {
       try {
         await player?.play(res.audio.base64, res.audio.mime || 'audio/wav')
       } catch (err) {
-        if (token === seq) setError(errorText(err))
+        if (token === seq) {
+          setError(errorText(err))
+          void afterTurn(token, ERROR_RELISTEN_MS)
+        }
         return
       }
     }
-    if (token === seq && phase.value === 'speaking') phase.value = 'idle'
-    if (token === seq && !isAudio) focusInput()
+    if (token !== seq) return
+    if (phase.value === 'speaking') phase.value = 'idle'
+    await afterTurn(token, RELISTEN_DELAY_MS)
+    if (token === seq && !isAudio && !handsFreeOn.value) focusInput()
   } catch (err) {
     if (token !== seq || isAbort(err)) return
     turnAbort = null
-    clearPhaseTimer()
+    phaseTimer = clearTimer(phaseTimer)
     userBubble.pending = false
     if (!userBubble.text) userBubble.text = '(음성 메시지)'
     setError(errorText(err))
+    void afterTurn(token, ERROR_RELISTEN_MS)
   }
 }
 
@@ -337,9 +579,9 @@ function focusInput() {
   })
 }
 
-/* ---------- recording ---------- */
+/* ---------- hold-to-talk (hands-free off) ---------- */
 async function onMicPress() {
-  if (!inCall.value || busy.value || recording.value || !micAvailable.value) return
+  if (!inCall.value || busy.value || recording.value || listening.value || !micOk.value) return
   pressActive = true
   const token = ++seq
   abortTurn()
@@ -347,10 +589,14 @@ async function onMicPress() {
   errorMsg.value = null
   hint.value = null
   phase.value = 'listening'
+  recorder.onLevel = (rms) => {
+    micLevel.value = Math.min(1, rms * 5)
+  }
   try {
     await recorder.start()
   } catch (err) {
     pressActive = false
+    recorder.onLevel = null
     if (token !== seq) return
     const info = describeMicError(err)
     if (info.denied) micDenied.value = true
@@ -361,6 +607,7 @@ async function onMicPress() {
   if (token !== seq || !pressActive) {
     // Released (or call ended) before the mic opened.
     recorder.cancel()
+    recorder.onLevel = null
     if (token === seq) phase.value = 'idle'
     pressActive = false
     return
@@ -397,19 +644,20 @@ function finishRecording() {
   pressActive = false
   recProgress.value = 0
   micLevel.value = 0
+  recorder.onLevel = null
   const rec = recorder.stop()
-  const seconds = Math.min(rec.seconds, rec.sampleRate > 0 ? rec.samples.length / rec.sampleRate : rec.seconds)
-  if (seconds < MIN_RECORD_SEC || rec.samples.length < rec.sampleRate * MIN_RECORD_SEC) {
+  if (rec.seconds < MIN_HOLD_SEC) {
     phase.value = 'idle'
     hint.value = '녹음이 너무 짧습니다. 버튼을 누른 채 말씀해 주세요.'
     return
   }
   const wav = encodeWav(rec.samples, rec.sampleRate)
-  void runTurn({ audioBase64: arrayBufferToBase64(wav), seconds })
+  void runTurn({ audioBase64: arrayBufferToBase64(wav), seconds: rec.seconds })
 }
 
 function cancelRecording() {
   stopRecTimer()
+  recorder.onLevel = null
   recorder.cancel()
   recording.value = false
   pressActive = false
@@ -432,17 +680,23 @@ onBeforeUnmount(() => {
   ++seq
   abortTurn()
   player?.stop()
+  stopListening()
   cancelRecording()
   void recorder.dispose()
   emit('active', false)
 })
 
-watch(
-  () => props.health?.asr?.ok,
-  (ok) => {
-    if (ok === false && recording.value) cancelRecording()
-  },
-)
+watch(micOk, (ok) => {
+  if (!ok) {
+    if (listening.value) {
+      stopListening()
+      if (phase.value === 'listening') phase.value = 'idle'
+    }
+    if (recording.value) cancelRecording()
+    recorder.close()
+    composerOpen.value = true
+  }
+})
 
 watch(phase, () => scrollLog())
 </script>
@@ -467,7 +721,32 @@ watch(phase, () => scrollLog())
             <p v-if="modelInfo" class="mt-0.5 truncate text-[11px] text-stone-400" data-testid="live-models">{{ modelInfo }}</p>
           </div>
         </div>
-        <div class="flex items-center gap-2">
+        <div class="flex flex-wrap items-center gap-2">
+          <!-- hands-free switch -->
+          <button
+            type="button"
+            role="switch"
+            :aria-checked="handsFree ? 'true' : 'false'"
+            :disabled="!micOk"
+            :title="micOk ? '켜면 말을 자동으로 감지해 보냅니다' : MIC_TOOLTIP"
+            class="inline-flex items-center gap-1.5 rounded-full py-1 pl-1 pr-2.5 text-[11px] font-semibold transition-colors hover:bg-stone-100 focus:outline-none focus:ring-2 focus:ring-stone-900 focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+            :class="handsFreeOn ? 'text-emerald-800' : 'text-stone-600'"
+            data-testid="live-handsfree"
+            @click="toggleHandsFree"
+          >
+            <span
+              class="relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors"
+              :class="handsFreeOn ? 'bg-emerald-600' : 'bg-stone-300'"
+              aria-hidden="true"
+            >
+              <span
+                class="absolute left-0.5 h-3 w-3 rounded-full bg-white shadow transition-transform"
+                :class="handsFreeOn ? 'translate-x-3' : 'translate-x-0'"
+              />
+            </span>
+            <Headphones class="h-3.5 w-3.5" aria-hidden="true" />
+            핸즈프리
+          </button>
           <span
             class="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-semibold ring-1"
             :class="pillClass"
@@ -503,10 +782,17 @@ watch(phase, () => scrollLog())
         <p v-if="ended" class="mt-5 text-sm font-semibold text-stone-900">통화가 종료되었습니다</p>
         <p class="mt-2 text-sm leading-6 text-stone-600">
           <template v-if="ended">같은 시나리오로 다시 시작하거나 데모를 닫을 수 있습니다.</template>
+          <template v-else-if="handsFreeOn">
+            버튼을 누르면 마이크 권한을 묻고 AI 상담원이 먼저 인사합니다.<br />
+            인사가 끝나면 전화처럼 그냥 말씀하세요 — 자동으로 인식합니다.
+          </template>
+          <template v-else-if="micOk">
+            버튼을 누르면 AI 상담원이 먼저 인사합니다.<br />
+            마이크를 누른 채 말하거나, 텍스트로 대화해 보세요.
+          </template>
           <template v-else>
             버튼을 누르면 AI 상담원이 먼저 인사합니다.<br />
-            <template v-if="micAvailable">마이크를 누른 채 말하거나, 텍스트로 대화해 보세요.</template>
-            <template v-else>텍스트로 대화해 보세요.</template>
+            텍스트로 대화해 보세요.
           </template>
         </p>
         <div class="mt-6 flex flex-wrap items-center justify-center gap-3">
@@ -564,7 +850,19 @@ watch(phase, () => scrollLog())
           </div>
         </div>
 
-        <!-- Inline error -->
+        <!-- Notices -->
+        <div
+          v-if="notice"
+          class="mx-4 mb-3 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800"
+          role="status"
+          data-testid="live-notice"
+        >
+          <Mic class="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+          <span class="min-w-0 flex-1">{{ notice }}</span>
+          <button type="button" class="shrink-0 rounded px-1 font-semibold hover:bg-amber-100" aria-label="안내 닫기" @click="notice = null">
+            <X class="h-3.5 w-3.5" aria-hidden="true" />
+          </button>
+        </div>
         <div
           v-if="errorMsg"
           class="mx-4 mb-3 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800"
@@ -578,54 +876,121 @@ watch(phase, () => scrollLog())
           </button>
         </div>
 
-        <!-- Composer -->
-        <form class="border-t border-stone-100 px-4 py-3" @submit.prevent="sendText">
-          <div class="flex flex-col gap-2 sm:flex-row sm:items-center">
-            <label for="live-text-input" class="sr-only">메시지 입력</label>
-            <input
-              id="live-text-input"
-              ref="inputEl"
-              v-model="draft"
-              type="text"
-              autocomplete="off"
-              enterkeyhint="send"
-              maxlength="300"
-              :disabled="!canCompose"
-              :placeholder="recording ? '듣고 있어요… 버튼을 떼면 전송됩니다' : busy ? 'AI가 응답을 준비하는 중입니다…' : '예: 토요일 저녁 6시에 8명 단체석 되나요?'"
-              class="min-w-0 flex-1 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-900 transition-all placeholder:text-stone-400 focus:outline-none focus:ring-2 focus:ring-stone-400 disabled:bg-stone-50 disabled:text-stone-400"
-              data-testid="live-input"
-            />
-            <div class="flex items-center justify-end gap-2">
-              <MicButton
-                :disabled="!inCall || busy || !micAvailable"
-                :recording="recording"
-                :progress="recProgress"
-                :level="micLevel"
-                :title="micTitle"
-                @press="onMicPress"
-                @release="onMicRelease"
-              />
-              <button
-                type="submit"
-                class="inline-flex h-12 items-center justify-center gap-1.5 rounded-xl bg-stone-950 px-4 text-sm font-semibold text-white transition-colors hover:bg-stone-800 focus:outline-none focus:ring-2 focus:ring-stone-900 focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
-                :disabled="!canCompose || !draft.trim()"
-                data-testid="live-send"
+        <!-- Hands-free status strip -->
+        <div
+          v-if="strip"
+          class="flex min-h-[3.25rem] flex-wrap items-center justify-between gap-x-4 gap-y-2 border-t border-stone-100 px-4 py-2.5"
+          data-testid="live-strip"
+          :data-strip="strip"
+          :data-threshold="vadThreshold ?? ''"
+        >
+          <template v-if="strip === 'listening' || strip === 'speech'">
+            <div class="flex min-w-0 items-center gap-3">
+              <span
+                class="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full"
+                :class="strip === 'speech' ? 'bg-emerald-600 text-white shadow-md shadow-emerald-900/20' : 'bg-emerald-50 text-emerald-700 ring-1 ring-emerald-100'"
+                aria-hidden="true"
               >
-                <SendHorizontal class="h-4 w-4" aria-hidden="true" />
-                보내기
-              </button>
+                <Mic class="h-4 w-4" />
+              </span>
+              <LevelMeter :level="level" :active="strip === 'speech'" />
             </div>
-          </div>
-          <p class="mt-2 min-h-[1.25rem] text-[11px] leading-5" :class="hint ? 'text-amber-700' : 'text-stone-400'" data-testid="live-hint">
-            <template v-if="recording">
-              <span class="font-semibold text-emerald-700 tabular-nums">{{ recElapsed.toFixed(1) }}초</span>
-              · 버튼을 떼면 전송 · 최대 15초
-            </template>
-            <template v-else-if="hint">{{ hint }}</template>
-            <template v-else-if="!micAvailable">{{ MIC_TOOLTIP }}</template>
-            <template v-else>마이크 버튼을 누른 채 말하고, 떼면 전송됩니다 · 최대 15초 · Enter로 텍스트 전송</template>
-          </p>
-        </form>
+            <p class="text-xs leading-5" :class="strip === 'speech' ? 'font-semibold text-emerald-700' : hint ? 'text-amber-700' : 'text-stone-500'" data-testid="live-strip-text">
+              <template v-if="strip === 'speech'">음성 감지 중 · <span class="tabular-nums">{{ speechSec.toFixed(1) }}초</span></template>
+              <template v-else-if="hint">{{ hint }}</template>
+              <template v-else>듣고 있어요 — 편하게 말씀하세요</template>
+            </p>
+          </template>
+          <template v-else-if="strip === 'busy'">
+            <div class="flex items-center gap-3 text-xs text-stone-500">
+              <span class="inline-flex h-9 w-9 items-center justify-center rounded-full bg-stone-950 text-white" aria-hidden="true">
+                <span class="h-1.5 w-1.5 animate-pulse rounded-full bg-white" />
+              </span>
+              <span data-testid="live-strip-text">{{ phase === 'recognizing' ? '음성을 인식하는 중…' : '답변을 생성하는 중…' }}</span>
+            </div>
+          </template>
+          <template v-else-if="strip === 'speaking'">
+            <div class="flex items-center gap-3 text-xs text-stone-500">
+              <span class="inline-flex h-9 w-9 items-center justify-center rounded-full bg-emerald-50 text-emerald-700 ring-1 ring-emerald-100" aria-hidden="true">
+                <Volume2 class="h-4 w-4" />
+              </span>
+              <span data-testid="live-strip-text">AI가 말하는 중 · 마이크 꺼짐</span>
+            </div>
+          </template>
+          <template v-else>
+            <p class="text-xs leading-5" :class="strip === 'paused' ? 'text-amber-700' : 'text-stone-500'" data-testid="live-strip-text">
+              {{ strip === 'paused' ? (hint ?? '응답이 없어 듣기를 멈췄습니다.') : '듣기가 멈춰 있습니다.' }}
+            </p>
+            <button type="button" :class="[ui.btnPillLight, 'py-2 text-xs']" data-testid="live-resume" @click="startListening({ recalibrate: true })">
+              <RotateCcw class="h-3.5 w-3.5" aria-hidden="true" />
+              다시 듣기
+            </button>
+          </template>
+        </div>
+
+        <!-- Text composer (collapsible in hands-free mode) -->
+        <div class="border-t border-stone-100">
+          <button
+            v-if="handsFreeOn"
+            type="button"
+            class="flex w-full items-center justify-between px-4 py-2 text-[11px] font-semibold text-stone-500 transition-colors hover:bg-stone-50 hover:text-stone-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-stone-900"
+            :aria-expanded="composerOpen ? 'true' : 'false'"
+            aria-controls="live-composer"
+            data-testid="live-composer-toggle"
+            @click="composerOpen = !composerOpen"
+          >
+            <span class="inline-flex items-center gap-1.5"><Keyboard class="h-3.5 w-3.5" aria-hidden="true" /> 텍스트로 입력</span>
+            <ChevronDown class="h-3.5 w-3.5 transition-transform" :class="composerOpen ? 'rotate-180' : ''" aria-hidden="true" />
+          </button>
+          <form v-show="showComposer" id="live-composer" class="px-4 pb-3" :class="handsFreeOn ? 'pt-1' : 'pt-3'" data-testid="live-composer" @submit.prevent="sendText">
+            <div class="flex flex-col gap-2 sm:flex-row sm:items-center">
+              <label for="live-text-input" class="sr-only">메시지 입력</label>
+              <input
+                id="live-text-input"
+                ref="inputEl"
+                v-model="draft"
+                type="text"
+                autocomplete="off"
+                enterkeyhint="send"
+                maxlength="300"
+                :disabled="!canCompose"
+                :placeholder="recording ? '듣고 있어요… 버튼을 떼면 전송됩니다' : busy ? 'AI가 응답을 준비하는 중입니다…' : '예: 토요일 저녁 6시에 8명 단체석 되나요?'"
+                class="min-w-0 flex-1 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-900 transition-all placeholder:text-stone-400 focus:outline-none focus:ring-2 focus:ring-stone-400 disabled:bg-stone-50 disabled:text-stone-400"
+                data-testid="live-input"
+              />
+              <div class="flex items-center justify-end gap-2">
+                <MicButton
+                  v-if="!handsFreeOn"
+                  :disabled="!inCall || busy || !micOk || listening"
+                  :recording="recording"
+                  :progress="recProgress"
+                  :level="micLevel"
+                  :title="micTitle"
+                  @press="onMicPress"
+                  @release="onMicRelease"
+                />
+                <button
+                  type="submit"
+                  class="inline-flex h-12 items-center justify-center gap-1.5 rounded-xl bg-stone-950 px-4 text-sm font-semibold text-white transition-colors hover:bg-stone-800 focus:outline-none focus:ring-2 focus:ring-stone-900 focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                  :disabled="!canCompose || !draft.trim()"
+                  data-testid="live-send"
+                >
+                  <SendHorizontal class="h-4 w-4" aria-hidden="true" />
+                  보내기
+                </button>
+              </div>
+            </div>
+            <p v-if="!handsFreeOn" class="mt-2 min-h-[1.25rem] text-[11px] leading-5" :class="hint ? 'text-amber-700' : 'text-stone-400'" data-testid="live-hint">
+              <template v-if="recording">
+                <span class="font-semibold text-emerald-700 tabular-nums">{{ recElapsed.toFixed(1) }}초</span>
+                · 버튼을 떼면 전송 · 최대 15초
+              </template>
+              <template v-else-if="hint">{{ hint }}</template>
+              <template v-else-if="!micOk">{{ MIC_TOOLTIP }}</template>
+              <template v-else>마이크 버튼을 누른 채 말하고, 떼면 전송됩니다 · 최대 15초 · Enter로 텍스트 전송</template>
+            </p>
+          </form>
+        </div>
       </div>
 
       <audio ref="audioEl" preload="auto" class="hidden" data-testid="live-audio" />
