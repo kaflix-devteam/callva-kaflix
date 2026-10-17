@@ -229,10 +229,29 @@ export function buildSystemPrompt(scenario, voicePersona = null) {
   ].join('\n')
 }
 
-/** Short keyword hint for the ASR model (proper nouns / domain words) — whisper-style prompts are tiny. */
+/**
+ * Keyword hint for the ASR model (domain words / proper nouns). A comma list, not sentences:
+ * whisper-family models echo a sentence prompt back verbatim when the audio has no speech.
+ */
 export function asrPrompt(scenario) {
-  if (!scenario) return '콜바 전화 상담. 예약, 문의, 견적.'
-  return `콜바 ${scenario.industry} 전화 상담. ${scenario.title}. ${scenario.desc}.`.slice(0, 200)
+  const words = ['콜바', '예약', '문의']
+  if (scenario) {
+    words.push(scenario.industry)
+    for (const w of `${scenario.title} ${scenario.desc}`.split(/[\s·,.()/]+/)) {
+      if (w.length >= 2 && w.length <= 5 && !words.includes(w)) words.push(w)
+      if (words.length >= 12) break
+    }
+  }
+  return words.join(', ').slice(0, 200)
+}
+
+/** Whisper-style models return the prompt itself (or a chunk of it) for silent audio — treat that as nothing heard. */
+export function isPromptEcho(text, prompt) {
+  const norm = (s) => String(s ?? '').replace(/[\s\p{P}]/gu, '')
+  const t = norm(text)
+  const p = norm(prompt)
+  if (!t || !p) return false
+  return t === p || (t.length >= 10 && p.includes(t)) || (p.length >= 10 && t.includes(p))
 }
 
 /**
@@ -759,13 +778,19 @@ export async function asrOpenai(wav, { prompt } = {}, cfg = getVoiceConfig(), ti
     body: form,
   }, timeoutMs, LABEL.asr, 'openai')
   if (res.status === 400) {
+    // "couldn't use this audio" (too short, unreadable, …) — same situation as qwen's 422 → turn falls back to "잘 못 들었어요"
     console.warn(`[voice] openai ASR rejected audio: ${await errorExcerpt(res)}`)
-    throw new VoiceError(415, '읽을 수 있는 오디오가 아니거나 너무 깁니다 (openai)')
+    throw new VoiceError(422, '오디오를 인식할 수 없습니다 (너무 짧거나 읽을 수 없음) (openai)')
   }
   if (!res.ok) throw await openaiHttpError(res, LABEL.asr)
   const data = await readJson(res, LABEL.asr, 'openai')
+  let text = cleanTranscript(data?.text)
+  if (isPromptEcho(text, prompt)) {
+    console.warn(`[voice] openai ASR echoed the prompt (no speech?) → empty transcript`)
+    text = ''
+  }
   return {
-    text: cleanTranscript(data?.text),
+    text,
     audioSeconds: wavInfo(wav)?.seconds ?? null,
     elapsedMs: null,
     asrMs: since(t0),

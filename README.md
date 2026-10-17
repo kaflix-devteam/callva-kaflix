@@ -75,18 +75,19 @@ JSON 배열 파일이며 첫 요청 시 자동 생성됩니다(임시 파일 + r
 
 ## GPU 음성 모델 연동 (실제 AI 통화 데모)
 
-랜딩 페이지의 "AI 통화 체험"은 목 데이터가 아니라 **사내 GPU 서버의 실제 모델**(LLM · TTS · STT)로 동작합니다.
-브라우저 → Express(`/api/voice/*`) → SSH 터널 → GPU 서버 순으로 호출하며, 브라우저는 GPU 서버에 직접 접근하지 않습니다.
+랜딩 페이지의 "AI 통화 체험"은 목 데이터가 아니라 **실제 모델**(LLM · TTS · STT)로 동작합니다. 서비스마다 프로바이더를 고를 수 있습니다.
 
-| 역할 | 서버 | 모델 (예시) |
+| 역할 | `openai` 프로바이더 | `qwen` 프로바이더 (사내 GPU 서버, SSH 터널) |
 | --- | --- | --- |
-| LLM (대화) | Ollama 네이티브 API (`/api/chat`, `think:false`, 비스트리밍) | `qwen3.5:4b` |
-| TTS (음성 합성) | `POST /v1/tts` → `audio/wav` 24kHz mono PCM16 | Qwen3-TTS |
-| STT/ASR (음성 인식) | `POST /v1/asr` (원시 WAV 본문) → `{ text }` | Qwen3-ASR |
+| LLM (대화) | `POST /v1/chat/completions` — 기본 `gpt-4.1-mini` | Ollama 네이티브 `/api/chat` (`think:false`, 비스트리밍) — 기본 `qwen3.5:4b` |
+| TTS (음성 합성) | `POST /v1/audio/speech` (`response_format: wav`, `voice`·`speed`·`instructions`) — 기본 `gpt-4o-mini-tts` | `POST /v1/tts` → `audio/wav` 24kHz mono PCM16 (`speaker`만 지원, 속도 미지원) |
+| STT/ASR (음성 인식) | `POST /v1/audio/transcriptions` (multipart, `language: ko`, 시나리오 핵심어 프롬프트) — 기본 `gpt-4o-mini-transcribe` | `POST /v1/asr` (원시 WAV 본문) → `{ text }` |
+
+브라우저 → Express(`/api/voice/*`) → (OpenAI API 또는 SSH 터널 → GPU 서버) 순으로 호출하며, 브라우저는 API 키나 GPU 서버에 직접 접근하지 않습니다. 프로바이더 간 **자동 폴백은 없습니다** — 실패하면 어느 프로바이더였는지 적힌 502/504 오류가 그대로 반환됩니다.
 
 ### 1. 환경 설정 (`.env`)
 
-설정은 **환경변수로만** 읽습니다(이 저장소는 공개이므로 호스트·포트를 코드에 넣지 않습니다). `.env.example`을 복사해 `.env`를 만드세요 — `.env`는 gitignore 대상이며, 서버 시작 시 `process.loadEnvFile`로 읽습니다(이미 셸에 설정된 변수가 우선).
+설정은 **환경변수로만** 읽습니다(이 저장소는 공개이므로 호스트·포트·키를 코드에 넣지 않습니다). `.env.example`을 복사해 `.env`를 만드세요 — `.env`는 gitignore 대상이며, 서버 시작 시 `process.loadEnvFile`로 읽습니다(이미 셸에 설정된 변수가 우선). **`OPENAI_API_KEY`는 `.env`에만 두고 절대 커밋하지 마세요.**
 
 ```bash
 cp .env.example .env   # 값은 사내 담당자에게 확인
@@ -94,14 +95,18 @@ cp .env.example .env   # 값은 사내 담당자에게 확인
 
 | 변수 | 설명 |
 | --- | --- |
+| `OPENAI_API_KEY` | OpenAI API 키. 있으면 세 서비스의 기본 프로바이더가 `openai`가 됩니다 |
+| `VOICE_LLM_PROVIDER` / `VOICE_TTS_PROVIDER` / `VOICE_ASR_PROVIDER` | `openai` 또는 `qwen`. 기본값: 키가 있으면 `openai`, 없으면 `qwen`. 다른 값은 경고 후 기본값 |
+| `OPENAI_LLM_MODEL` / `OPENAI_TTS_MODEL` / `OPENAI_ASR_MODEL` | OpenAI 모델 이름 (기본 `gpt-4.1-mini` / `gpt-4o-mini-tts` / `gpt-4o-mini-transcribe`) |
+| `OPENAI_BASE_URL` | OpenAI 호환 엔드포인트 (기본 `https://api.openai.com/v1`) |
 | `VOICE_HOST` | SSH 터널 대상 (`user@host`) — `scripts/voice-tunnel.sh`만 사용 |
 | `VOICE_*_REMOTE_PORT` / `VOICE_*_LOCAL_PORT` | 터널 포트 매핑 (LLM / TTS / ASR). 생략 시 스크립트 기본값 |
-| `VOICE_LLM_URL` | 터널을 통한 Ollama 주소 (예: `http://127.0.0.1:<LLM_LOCAL_PORT>`) |
+| `VOICE_LLM_URL` | 터널을 통한 Ollama 주소 (예: `http://127.0.0.1:<LLM_LOCAL_PORT>`) — `qwen` LLM에 필요 |
 | `VOICE_LLM_MODEL` | Ollama 모델 이름 (기본 `qwen3.5:4b`) |
-| `VOICE_TTS_URL` | 터널을 통한 TTS 서버 주소 |
-| `VOICE_ASR_URL` | 터널을 통한 ASR 서버 주소 |
+| `VOICE_TTS_URL` | 터널을 통한 TTS 서버 주소 — `qwen` TTS에 필요 |
+| `VOICE_ASR_URL` | 터널을 통한 ASR 서버 주소 — `qwen` ASR에 필요 |
 
-`VOICE_LLM_URL` / `VOICE_TTS_URL` / `VOICE_ASR_URL` 중 하나라도 비어 있으면 음성 데모는 **비활성화**됩니다 — `GET /api/voice/health`가 `enabled:false`를 돌려주고 모델 호출 라우트는 `503 { error: '음성 서버 설정이 없습니다 (VOICE_* env)' }`로 응답하며, 나머지 API는 그대로 동작합니다.
+활성 프로바이더의 설정(`openai`면 키, `qwen`이면 해당 URL)이 **LLM 또는 TTS**에서 빠져 있으면 음성 데모는 **비활성화**됩니다 — `GET /api/voice/health`가 `enabled:false`를 돌려주고 모델 호출 라우트는 `503 { error: '음성 서버 설정이 없습니다 (VOICE_* / OPENAI_API_KEY env)' }`로 응답하며, 나머지 API는 그대로 동작합니다. **ASR** 설정만 빠진 경우에는 텍스트 입력 턴은 동작하고 `/asr`·오디오 턴만 503입니다.
 
 ### 2. 실행
 
@@ -117,47 +122,59 @@ GPU 서버의 모델 포트는 루프백 전용이므로 SSH 터널이 먼저 �
 
 | 메서드 | 경로 | 요청 | 응답 |
 | --- | --- | --- | --- |
-| `GET` | `/api/voice/health` | — | `{ enabled, llm: { ok, model, latencyMs, error? }, tts: { ok, latencyMs, speaker?, error? }, asr: { ok, latencyMs, error? }, checkedAt }` — 세 서버를 병렬로 점검(각 3초 타임아웃), **10초 캐시**. `enabled = 설정 존재 ∧ llm.ok ∧ tts.ok` (ASR만 죽으면 텍스트 입력으로 폴백 가능) |
-| `GET` | `/api/voice/scenarios` | — | `{ persona, scenarios: [{ id, industry, outbound, title, desc, greeting, facts }] }` (`shared/voiceScenarios.json`, `handoff`는 제외) |
-| `POST` | `/api/voice/chat` | `{ scenarioId, messages: [{ role: 'user'\|'assistant', content }] }` (마지막은 `user`) | `{ reply, timings: { llmMs }, usage: { evalCount } }` |
-| `POST` | `/api/voice/tts` | `{ text }` (1~300자) | `audio/wav` 본문 + `X-Audio-Seconds`, `X-Elapsed-Ms`, `X-Sample-Rate` 헤더 |
-| `POST` | `/api/voice/asr` | 원시 WAV 본문, `Content-Type: audio/wav` (≤ 8MB, ≤ 30초) | `{ text, audioSeconds, elapsedMs }` |
-| `POST` | `/api/voice/turn` | `{ scenarioId, text \| audioBase64, history? }` — `text`와 `audioBase64` 중 **하나만** (`audioBase64`는 WAV의 base64, ≤ 8MB) | `{ transcript, reply, audio: { base64, mime: 'audio/wav', seconds } \| null, timings: { asrMs, llmMs, ttsMs, totalMs, ttsError? }, history }` |
+| `GET` | `/api/voice/health` | — | `{ enabled, providers: { llm, tts, asr }, llm: { ok, provider, model, latencyMs, error? }, tts: { ok, provider, model, latencyMs, speaker?, error? }, asr: { ok, provider, model, latencyMs, error? }, openai: { ok, latencyMs, error? }, qwen: { llm, tts, asr }, checkedAt }` — OpenAI(`GET /v1/models`)와 GPU 서버(`/healthz`, `/api/tags`)를 병렬 점검(각 3초 타임아웃), **10초 캐시**. `enabled = 활성 프로바이더 기준 llm.ok ∧ tts.ok` (ASR만 죽으면 텍스트 입력으로 폴백 가능). `qwen` 묶음은 프로바이더가 `openai`일 때 참고용 |
+| `GET` | `/api/voice/scenarios` | — | `{ persona, scenarios: [{ id, industry, outbound, title, desc, greeting, facts }] }` (`shared/voiceScenarios.json`, `handoff`·`promptFacts`는 제외) |
+| `GET` | `/api/voice/personas` | — | `{ default, speeds: [{ id, label, factor }], personas: [{ id, name, tagline, sample, gender, provider, voice }] }` (`shared/voicePersonas.json`, `style`·`instructions`는 비노출) |
+| `POST` | `/api/voice/chat` | `{ scenarioId, messages: [{ role: 'user'\|'assistant', content }], voice? }` (마지막은 `user`) | `{ reply, timings: { llmMs, providers: { llm } }, usage: { evalCount } }` |
+| `POST` | `/api/voice/tts` | `{ text, voice? }` (1~300자) | `audio/wav` 본문 + `X-Audio-Seconds`, `X-Elapsed-Ms`(qwen만), `X-Sample-Rate`, `X-Voice-Persona`, `X-Voice-Provider` 헤더 |
+| `POST` | `/api/voice/asr` | 원시 WAV 본문, `Content-Type: audio/wav` (≤ 8MB, ≤ 30초). `?scenarioId=`를 주면 인식 힌트로 사용 | `{ text, audioSeconds, elapsedMs, provider }` |
+| `POST` | `/api/voice/turn` | `{ scenarioId, text \| audioBase64, history?, voice? }` — `text`와 `audioBase64` 중 **하나만** (`audioBase64`는 WAV의 base64, ≤ 8MB) | `{ transcript, reply, audio: { base64, mime: 'audio/wav', seconds, voice: { persona, provider, voice } } \| null, timings: { asrMs, llmMs, ttsMs, totalMs, ttsError?, providers: { asr, llm, tts } }, history }` |
+
+`voice`는 선택 필드 `{ persona?: string, speed?: 'slow' | 'normal' | 'fast' }`입니다(기본 persona는 `/personas`의 `default`, speed는 `normal`; 모르는 값은 422).
 
 `turn`은 한 번의 호출로 **(ASR) → LLM → TTS**를 수행합니다.
 
 - `history`는 지금까지의 대화(`[{ role, content }]`)이며, 응답의 `history`에는 사용자 발화와 AI 답변이 덧붙어 돌아오므로 다음 호출에 그대로 넘기면 됩니다. 비어 있으면 시나리오 `greeting`이 첫 assistant 턴으로 자동 삽입됩니다.
-- `timings.*`는 실행되지 않은 단계가 `null`입니다(텍스트 입력이면 `asrMs`, 인식 결과가 비면 `llmMs`).
+- `timings.*`는 실행되지 않은 단계가 `null`입니다(텍스트 입력이면 `asrMs`, 인식 결과가 비면 `llmMs`). `timings.providers`도 같은 규칙입니다.
 - ASR 결과가 비면 LLM을 건너뛰고 `transcript: ''`와 함께 "죄송해요, 잘 못 들었어요…" 안내 음성을 합성해 돌려주며, 이때 `history`는 바뀌지 않습니다.
 - TTS만 실패하면 `reply`는 정상 반환되고 `audio: null`, `timings.ttsError`에 사유가 담깁니다.
 
 ```bash
-# 텍스트로 한 턴
+# 텍스트로 한 턴 (준호 목소리, 빠르게)
 curl -X POST http://localhost:3001/api/voice/turn \
   -H 'Content-Type: application/json' \
-  -d '{"scenarioId":"restaurant","text":"토요일 저녁 6시에 8명 단체석 되나요?"}'
+  -d '{"scenarioId":"restaurant","text":"토요일 저녁 6시에 8명 단체석 되나요?","voice":{"persona":"junho","speed":"fast"}}'
 
 # 답변만 음성으로
 curl -X POST http://localhost:3001/api/voice/tts \
   -H 'Content-Type: application/json' \
-  -d '{"text":"네, 담당자가 확인 후 연락드리겠습니다."}' -o reply.wav
+  -d '{"text":"네, 담당자가 확인 후 연락드리겠습니다.","voice":{"persona":"miyoung"}}' -o reply.wav
 
 # 녹음(WAV)을 텍스트로
-curl -X POST http://localhost:3001/api/voice/asr \
+curl -X POST 'http://localhost:3001/api/voice/asr?scenarioId=restaurant' \
   -H 'Content-Type: audio/wav' --data-binary @reply.wav
 ```
+
+### 목소리 페르소나
+
+`shared/voicePersonas.json`에 목소리 4종(수진·미영·준호·상철)과 말 빠르기 3단계(`slow` 0.9 · `normal` 1.0 · `fast` 1.15)가 정의되어 있습니다. 프런트·서버가 같은 파일을 읽습니다.
+
+- **TTS**: `openai`면 `persona.openai.voice`·`instructions`를 쓰고 속도는 `persona.openai.speed × speeds.factor`(0.5~2.0으로 클램프). `qwen`이면 `persona.qwen.speaker`만 전달하고 속도는 무시됩니다(현재 JSON은 네 페르소나 모두 같은 `speaker`라 qwen 모드에서는 목소리가 한 가지입니다).
+- **LLM**: 시스템 프롬프트에 `persona.style` 한 단락이 "말투:" 항목으로 들어가 답변 어조가 바뀝니다(규칙·길이 제한은 그대로).
+- `/personas` 응답의 `provider`·`voice`는 현재 TTS 프로바이더 기준입니다. `style`·`instructions`는 서버 안에서만 씁니다.
 
 ### 4. 동작 방식과 제한
 
 - **시스템 프롬프트**는 `shared/voiceScenarios.json`의 `persona` + 시나리오(업종·역할·매장 정보·인바운드/아웃바운드)로 요청마다 조립합니다. 매장 정보는 `promptFacts`(숫자·시간을 한글로 풀어 쓴 프롬프트용 목록)가 있으면 그것을, 없으면 `facts`를 사용합니다. 규칙(목록에 없는 시간·가격·조건은 말하지 않음, 예약 임의 확정 금지)을 맨 앞에 두고 few-shot 예시 2쌍을 넣어 **한 문장·40자 이내** 답변을 지시합니다. 모델에는 최근 **12개 메시지**만 전달합니다.
 - **답변 후처리**: `<think>` 잔여물·마크다운·한자·화자 라벨을 제거하고 공백을 정리한 뒤 **첫 두 문장만** 남기고(. ? ! 및 "…요/…니다" 경계) **120자**에서 하드 캡합니다. TTS 시간은 답변 길이에 비례하므로(약 0.18초/자) 길이 제한이 곧 체감 지연 제한입니다.
-- **동시성**: 프로세스 전체에서 모델 파이프라인 **2개 동시 실행 + 4개 대기**(chat/tts/asr/turn 공용). 초과 시 즉시 `503 { error: '음성 데모가 혼잡합니다…' }`. GPU 서버의 TTS는 요청을 순차 처리하므로 대기 중인 요청은 그만큼 늦게 응답합니다.
-- **타임아웃**: LLM 20초(`504 AI 응답 시간이 초과되었습니다`), TTS 30초, ASR 15초, health 3초. 연결 실패는 502. 오류는 항상 한국어 `{ error }` JSON이며 스택을 노출하지 않습니다.
-- **입력 검증** → 422(`text` 비어 있음/300자 초과, `text`·`audioBase64` 동시 전송 등), 알 수 없는 `scenarioId` → 404, WAV가 아닌 오디오 → 415, 8MB 초과 → 413.
-- **체감 지연**(터널 경유, 한 문장 기준 실측): LLM 약 0.2초, ASR 약 0.2~0.3초, **TTS 2~6초**(합성 음성 길이에 비례 — 답변 두 문장이면 5초 이상). 전체 `turn`은 대부분 TTS 시간입니다.
+- **동시성**: 프로세스 전체에서 모델 파이프라인 **2개 동시 실행 + 4개 대기**(chat/tts/asr/turn 공용, 프로바이더 무관). 초과 시 즉시 `503 { error: '음성 데모가 혼잡합니다…' }`. GPU 서버의 TTS는 요청을 순차 처리하므로 대기 중인 요청은 그만큼 늦게 응답합니다.
+- **타임아웃**: LLM 20초(`504 AI 응답 시간이 초과되었습니다 (openai|qwen)`), TTS 30초, ASR 15초, health 3초. 연결 실패·OpenAI 429/5xx는 502, OpenAI 401은 `음성 API 키가 올바르지 않습니다 (openai)`. 오류 메시지에는 프로바이더가 적히며, 항상 한국어 `{ error }` JSON이고 스택을 노출하지 않습니다.
+- **입력 검증** → 422(`text` 비어 있음/300자 초과, `text`·`audioBase64` 동시 전송, 모르는 `voice.persona`/`voice.speed` 등), 알 수 없는 `scenarioId` → 404, WAV가 아닌 오디오 → 415, 8MB 초과 → 413.
+- **체감 지연**(한 문장 36~45자 기준 실측): `openai` — LLM 0.6~0.9초, TTS 1.5~3.0초(음성 5~8초 분량), ASR 약 0.4초, `turn` 전체 2.2~3.7초. `qwen`(터널 경유) — LLM 0.2초(GPU 경합 시 1초 이상), ASR 0.2~0.3초, TTS 3~6초(음성 길이에 비례, 경합 시 10초 이상). 어느 쪽이든 `turn`은 대부분 TTS 시간입니다.
+- OpenAI TTS는 WAV를 스트리밍으로 보내 헤더의 크기 필드가 비어 있으므로 서버가 실제 길이로 **헤더를 고쳐서** 전달합니다(Safari 등에서 재생 실패 방지). `X-Audio-Seconds`도 이 헤더에서 계산합니다.
 - TTS 입력은 1~300자, ASR 입력은 30초 이하 WAV(샘플레이트 무관)입니다. 브라우저 `MediaRecorder`의 webm/ogg는 받지 않으므로 프런트에서 PCM WAV로 변환해 보내야 합니다.
-- 4B급 소형 모델이라 매장 정보에 없는 내용을 지어내거나(예: "마감되었습니다") 예약을 확정하듯 말하는 경우가 있습니다. 데모 목적이며 실제 응대 품질을 보장하지 않습니다.
-- 서버 로그에는 요청마다 단계별 소요 시간이 한 줄로 남습니다. 예) `[api] POST /api/voice/turn → 200 (3637.9ms) [voice route=turn scenario=hotel input=text asr=- llm=130ms tts=3505ms total=3636ms slots=0/0]`
+- `qwen` LLM(4B급 소형 모델)은 매장 정보에 없는 내용을 지어내거나(예: "마감되었습니다") 예약을 확정하듯 말하는 경우가 있고, `qwen` ASR은 숫자 읽기를 자주 틀립니다. 데모 목적이며 실제 응대 품질을 보장하지 않습니다.
+- 서버 로그에는 요청마다 프로바이더·단계별 소요 시간·토큰 사용량(`tok=입력/출력`, 로그에만)이 한 줄로 남습니다. 예) `[api] POST /api/voice/turn → 200 (3748ms) [voice route=turn scenario=restaurant persona=sujin speed=normal input=text asr=- llm=openai 751ms tts=openai 3.0s audio=7.49s tok=612/28 total=3.7s slots=0/0]`
 
 ## 페이지 목록
 
@@ -200,11 +217,12 @@ src/
   router/       vue-router 설정
 server/
   index.mjs     Express 5 앱
-  lib/          validate.mjs(요청 검증) · store.mjs(JSON 파일 저장소) · voice.mjs(LLM/TTS/ASR 클라이언트·프롬프트·세마포어)
+  lib/          validate.mjs(요청 검증) · store.mjs(JSON 파일 저장소) · voice.mjs(LLM/TTS/ASR 프로바이더 클라이언트·프롬프트·세마포어)
   routes/       voice.mjs(/api/voice 라우터)
   data/         접수 데이터 (git 제외)
 shared/
-  voiceScenarios.json   AI 통화 데모 페르소나·시나리오 (프런트·서버 공용)
+  voiceScenarios.json   AI 통화 데모 상담원 페르소나·시나리오 (프런트·서버 공용)
+  voicePersonas.json    목소리 페르소나 4종 · 말 빠르기 (프런트·서버 공용)
 scripts/
   voice-tunnel.sh       GPU 서버 SSH 터널 (.env의 VOICE_HOST 사용)
 ```
