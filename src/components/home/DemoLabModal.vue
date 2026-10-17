@@ -22,6 +22,7 @@ const emit = defineEmits<{ close: [] }>()
 
 const LINE_INTERVAL_MS = 900
 const HEALTH_INTERVAL_MS = 20_000
+const HEALTH_QUICK_RETRY_MS = 5000
 /** The live tab waits at most this long for the first health answer before falling back to the script. */
 const HEALTH_TIMEOUT_MS = 6_000
 
@@ -37,7 +38,6 @@ const dialogEl = ref<HTMLElement | null>(null)
 const healthResolved = ref(false)
 /** we moved the user to the script because the voice server was unavailable on open */
 const autoSwitched = ref(false)
-let userPickedTab = false
 
 const voiceEntry = computed<VoiceScenario | null>(() => {
   const id = props.scenario?.id
@@ -125,13 +125,24 @@ async function checkHealth() {
       healthAbort = null
     }
   }
-  if (settled && !healthResolved.value) {
-    healthResolved.value = true
-    // First answer of this open: fall back to the script only if the user has not picked a tab yet.
-    if (!liveEnabled.value && mode.value === 'live' && !userPickedTab && !liveActive.value) {
-      mode.value = 'sim'
-      autoSwitched.value = true
-    }
+  if (settled && !healthResolved.value) healthResolved.value = true
+  // The live tab is the product: never fall back to the script on our own. While the voice API is unreachable
+  // (e.g. the API process is restarting) keep showing "연결되지 않았습니다" and retry quickly until it comes back.
+  if (settled && !liveEnabled.value && isOpen.value && mode.value === 'live') scheduleQuickRetry()
+}
+
+let quickRetryTimer: ReturnType<typeof setTimeout> | null = null
+function scheduleQuickRetry() {
+  cancelQuickRetry()
+  quickRetryTimer = setTimeout(() => {
+    quickRetryTimer = null
+    if (isOpen.value && mode.value === 'live' && !liveEnabled.value && document.visibilityState === 'visible') void checkHealth()
+  }, HEALTH_QUICK_RETRY_MS)
+}
+function cancelQuickRetry() {
+  if (quickRetryTimer !== null) {
+    clearTimeout(quickRetryTimer)
+    quickRetryTimer = null
   }
 }
 
@@ -143,6 +154,7 @@ function startHealthPolling() {
 }
 
 function stopHealthPolling() {
+  cancelQuickRetry()
   if (healthTimer !== null) {
     clearInterval(healthTimer)
     healthTimer = null
@@ -150,7 +162,6 @@ function stopHealthPolling() {
 }
 
 function setMode(next: Mode) {
-  userPickedTab = true
   if (mode.value === next) return
   if (next === 'live') resetCall()
   else liveActive.value = false
@@ -272,7 +283,6 @@ watch(isOpen, async (open) => {
     // otherwise the live tab waits in "연결 확인 중" until the answer arrives (≤ HEALTH_TIMEOUT_MS).
     healthResolved.value = false
     autoSwitched.value = false
-    userPickedTab = false
     mode.value = 'live'
     lock()
     void checkHealth()

@@ -29,6 +29,20 @@ try {
   /* no .env — fine */
 }
 
+// Process-level guards: log and keep serving instead of dying on a stray async error.
+process.on('unhandledRejection', (reason) => {
+  console.error('[api] unhandledRejection:', reason instanceof Error ? reason.stack : reason)
+})
+process.on('uncaughtException', (err) => {
+  console.error('[api] uncaughtException:', err?.stack ?? err)
+})
+for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
+  process.on(sig, () => {
+    console.error(`[api] received ${sig} — shutting down`)
+    process.exit(0)
+  })
+}
+
 const isProd = process.env.NODE_ENV === 'production'
 const PORT = Number(process.env.PORT ?? 3001)
 const DIST_DIR = fileURLToPath(new URL('../dist/', import.meta.url))
