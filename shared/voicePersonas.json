@@ -33,7 +33,7 @@
       },
       "qwen": {
         "speaker": "Sohee",
-        "seed": 18
+        "seed": 14
       },
       "provider": "qwen",
       "supportsSpeed": false

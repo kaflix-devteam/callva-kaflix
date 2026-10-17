@@ -211,7 +211,7 @@ export function ttsParams(persona, speed, cfg = getVoiceConfig(), provider = tts
       instructions: persona.openai.instructions,
     }
   }
-  // `seed` pins the sampling so the same text always gets the same intonation (user picked Sohee seed 18).
+  // `seed` pins the sampling so the same text always gets the same intonation (user picked Sohee seed 14).
   const seed = Number.isInteger(persona.qwen?.seed) && persona.qwen.seed >= 0 ? persona.qwen.seed : null
   return { provider: 'qwen', voice: persona.qwen.speaker, speaker: persona.qwen.speaker, seed }
 }
