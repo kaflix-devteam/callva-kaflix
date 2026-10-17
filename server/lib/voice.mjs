@@ -211,7 +211,9 @@ export function ttsParams(persona, speed, cfg = getVoiceConfig(), provider = tts
       instructions: persona.openai.instructions,
     }
   }
-  return { provider: 'qwen', voice: persona.qwen.speaker, speaker: persona.qwen.speaker }
+  // `seed` pins the sampling so the same text always gets the same intonation (user picked Sohee seed 18).
+  const seed = Number.isInteger(persona.qwen?.seed) && persona.qwen.seed >= 0 ? persona.qwen.seed : null
+  return { provider: 'qwen', voice: persona.qwen.speaker, speaker: persona.qwen.speaker, seed }
 }
 
 /* ---------- prompt ---------- */
@@ -762,12 +764,12 @@ export async function ttsOpenai(text, { voice, speed, instructions }, cfg = getV
   }
 }
 
-export async function ttsQwen(text, { speaker }, cfg = getVoiceConfig(), timeoutMs = TIMEOUTS.tts) {
+export async function ttsQwen(text, { speaker, seed = null }, cfg = getVoiceConfig(), timeoutMs = TIMEOUTS.tts) {
   const t0 = now()
   const res = await upstreamFetch(`${cfg.ttsUrl}/v1/tts`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'audio/wav' },
-    body: JSON.stringify(speaker ? { text, speaker } : { text }),
+    body: JSON.stringify({ text, ...(speaker ? { speaker } : {}), ...(Number.isInteger(seed) ? { seed } : {}) }),
   }, timeoutMs, LABEL.tts, 'qwen')
   if (res.status === 422) {
     console.warn(`[voice] qwen TTS rejected text: ${await errorExcerpt(res)}`)
@@ -787,6 +789,7 @@ export async function ttsQwen(text, { speaker }, cfg = getVoiceConfig(), timeout
     provider: 'qwen',
     model: null,
     voice: speaker ?? null,
+    seed: Number.isInteger(seed) ? seed : null,
     speed: null, // qwen TTS has no speed control
   }
 }

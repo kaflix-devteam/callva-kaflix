@@ -32,7 +32,8 @@
         "instructions": "Voice: a bright, upbeat Korean woman in her late twenties working the phones at a busy restaurant. Tone: cheerful, energetic, warm and reassuring, with a light smile in the voice. Pacing: slightly fast but crisp and clearly articulated; quick, lively reactions like \"네네!\" and \"아, 그러시구나\" sound natural, not exaggerated. Language: natural spoken Korean (존댓말). Never sound robotic or flat."
       },
       "qwen": {
-        "speaker": "Sohee"
+        "speaker": "Sohee",
+        "seed": 18
       },
       "provider": "qwen",
       "supportsSpeed": false
